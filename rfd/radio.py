@@ -517,7 +517,12 @@ class Radio(QObject):
             res = self._core.read_params(remote=is_remote, timeout=3.0)  # type: ignore[union-attr]
             self.params_loaded.emit(res, is_remote)
         except Exception as e:
-            self.error.emit(f"read params: {e}")
+            # A remote read failing usually just means there's no linked
+            # partner radio — treat it as informational, not an error.
+            if is_remote:
+                self.log.emit(f"no remote radio response: {e}", 0)
+            else:
+                self.error.emit(f"read params: {e}")
         finally:
             self._back_to_data()
 
@@ -587,13 +592,50 @@ class Radio(QObject):
             return
         try:
             self._core.reboot(remote=is_remote)  # type: ignore[union-attr]
-            self.log.emit(f"rebooted {'remote' if is_remote else 'local'} radio", 0)
+            self.log.emit(
+                f"rebooted {'remote' if is_remote else 'local'} radio — "
+                "waiting for it to come back up…",
+                0,
+            )
+            # ATZ doesn't reply; the radio re-boots and re-opens its UART
+            # after ~3-6 seconds on SiK 3.x. We hold the executor (and
+            # therefore block any subsequent user request) until either it
+            # answers an AT probe or we hit the timeout. State stays as
+            # COMMAND during this wait, which keeps the read pump idle.
+            if not is_remote:
+                came_back = self._wait_for_radio(timeout=10.0)
+                if came_back:
+                    self.log.emit("radio is back online", 0)
+                else:
+                    self.log.emit(
+                        "radio did not respond within 10s — click Load Settings to reconnect",
+                        1,
+                    )
         except Exception as e:
             self.error.emit(f"reboot: {e}")
         finally:
-            # After reboot the radio drops the link briefly; just go back to data.
             self._set_state(self.STATE_DATA)
             self._start_read_pump()
+
+    def _wait_for_radio(self, timeout: float = 10.0) -> bool:
+        """After ATZ, poll AT until we get an OK reply or the deadline hits."""
+        if self._core is None:
+            return False
+        deadline = time.monotonic() + timeout
+        # Initial settle — SiK doesn't even open its UART for ~1s after ATZ.
+        time.sleep(1.5)
+        bracket = proto.CommandModeBracket(
+            quiet_before=1.1, quiet_after=1.1, reply_timeout=1.5
+        )
+        while time.monotonic() < deadline:
+            try:
+                if self._core.enter_command_mode(bracket):
+                    self._core.exit_command_mode()
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.5)
+        return False
 
     @_async
     @Slot(bool)
