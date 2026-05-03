@@ -88,6 +88,9 @@ class _Row:
     sreg: int
     is_pin: bool
     reg: RegisterDef
+    container: QWidget          # the row's outer QWidget — used by rebuild to
+                                # delete just this row without touching the
+                                # pin-group widget that sits in the same layout
     label: QLabel
     editor: QWidget
     dirty_marker: QLabel
@@ -323,7 +326,10 @@ class _RegisterPanel(QWidget):
 
         # Wire up the editor so the parent panel learns about edits and so
         # focus events bubble up as "this panel is active".
-        row = _Row(reg.sreg, is_pin, reg, label, editor, dirty, status)
+        row = _Row(
+            reg.sreg, is_pin, reg, row_widget,
+            label, editor, dirty, status,
+        )
         self._wire_editor(row)
         # Track interaction by hooking focus events on the editor.
         editor.installEventFilter(_FocusReporter(self))
@@ -406,17 +412,26 @@ class _RegisterPanel(QWidget):
         """Replace the S/R row widgets with ones reflecting `s_names` /
         `pin_names`.  Preserves dirty state where the sreg still exists in
         the new layout.
+
+        Crucially, deletes only the row containers — the pin_group widget
+        (which also lives in body_layout) is left in place so the pin
+        rows under it don't get cascade-deleted out from under their dict
+        references.
         """
-        # Remember which sregs were dirty AND their current values, so we
-        # can carry them across the rebuild.
         dirty_snapshot: dict[tuple[int, bool], int] = {}
         for key in list(self._dirty):
             row = self._rows.get(key)
             if row is not None:
                 dirty_snapshot[key] = row.value()
 
-        self._clear_layout(self._body_layout)
-        self._clear_layout(self._pin_layout)
+        # Remove only the row containers we created. body_layout's
+        # pin_group + stretch stay; pin_layout has only row containers
+        # so emptying it via the dict iteration is safe.
+        for row in list(self._rows.values()):
+            parent_layout = self._pin_layout if row.is_pin else self._body_layout
+            parent_layout.removeWidget(row.container)
+            row.container.setParent(None)
+            row.container.deleteLater()
         self._rows.clear()
         self._dirty.clear()
 
@@ -425,17 +440,23 @@ class _RegisterPanel(QWidget):
         self._pin_sreg_to_name = dict(pin_names)
         self._pin_name_to_sreg = {n: s for s, n in self._pin_sreg_to_name.items()}
 
+        # New S-reg rows go BEFORE the pin_group (and stretch) so they
+        # render at the top of the panel as expected.
+        pin_group_idx = self._body_layout.indexOf(self._pin_group)
+        if pin_group_idx < 0:
+            pin_group_idx = self._body_layout.count()
+        insert_at = pin_group_idx
         for sreg in sorted(self._sreg_to_name.keys()):
             name = self._sreg_to_name[sreg]
             reg = derive_def(sreg, name)
             row_widget, row = self._build_row(reg, is_pin=False, parent=self._body)
-            self._body_layout.addWidget(row_widget)
+            self._body_layout.insertWidget(insert_at, row_widget)
+            insert_at += 1
             self._rows[(sreg, False)] = row
 
         for sreg in sorted(self._pin_sreg_to_name.keys()):
             name = self._pin_sreg_to_name[sreg]
             reg = derive_def(sreg, name)
-            # Pin labels stay R-prefixed regardless of catalog label.
             reg = RegisterDef(
                 sreg=reg.sreg, name=reg.name,
                 label=f"Pin R{sreg} {name}" if name != "PIN_FUNC" else f"Pin R{sreg} function",
@@ -448,23 +469,11 @@ class _RegisterPanel(QWidget):
             self._pin_layout.addWidget(row_widget)
             self._rows[(sreg, True)] = row
 
-        # Restore previously-dirty values where the sreg still exists.
         for (sreg, is_pin), value in dirty_snapshot.items():
             row = self._rows.get((sreg, is_pin))
             if row is not None:
                 row.set_value(value)
                 self._mark_dirty(sreg, is_pin)
-
-    @staticmethod
-    def _clear_layout(layout) -> None:
-        while layout.count():
-            item = layout.takeAt(0)
-            if item is None:
-                continue
-            w = item.widget()
-            if w is not None:
-                w.setParent(None)
-                w.deleteLater()
 
     def sreg_to_name(self) -> dict[int, str]:
         return dict(self._sreg_to_name)
