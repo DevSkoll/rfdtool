@@ -16,6 +16,7 @@ from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -34,9 +35,18 @@ from PySide6.QtWidgets import (
 
 from rfd.presets import (
     BUILT_IN_PRESETS,
+    CATEGORY_MAXIMIZE,
+    CATEGORY_MODEL,
+    CATEGORY_REGION,
+    CATEGORY_USE_CASE,
     Profile,
+    delete_user_profile,
+    list_user_profiles,
     load_profile,
+    presets_by_category,
     save_profile,
+    save_user_profile,
+    user_profile_dir,
 )
 from rfd.radio import Radio
 from rfd.registers import (
@@ -47,15 +57,24 @@ from rfd.registers import (
     all_registers,
     validate,
 )
+from rfd.validation import ValidationReport, validate_config
+
+from .validation_dialog import ApplyPresetDialog, SavePresetDialog, ValidationDialog
 
 
 # Connected states in which the action buttons are usable. Anything else
 # (disconnected/bootloader) means the radio cannot service AT commands.
 _LIVE_STATES: frozenset[str] = frozenset({Radio.STATE_DATA, Radio.STATE_COMMAND})
 
-# QSS applied to a row's editor while it has unsaved changes — a soft amber
-# tint that is visible on both the light and dark Qt fusion palettes.
+# Editor background tints for the various row states. Dirty trumps validation
+# tints because un-saved edits matter more than stale validation results.
 _DIRTY_QSS = "background-color: #fff4c2;"
+_VALIDATION_QSS = {
+    "error":   "background-color: #ffd6d6;",
+    "warning": "background-color: #ffe4b5;",
+    "info":    "background-color: #e0f0ff;",
+    "ok":      "background-color: #d4edda;",
+}
 
 
 @dataclass
@@ -68,6 +87,10 @@ class _Row:
     label: QLabel
     editor: QWidget
     dirty_marker: QLabel
+    status_marker: QLabel
+    is_dirty: bool = False
+    validation_severity: str = ""   # "" | "error" | "warning" | "info" | "ok"
+    validation_titles: tuple[str, ...] = ()
 
     def value(self) -> int:
         if isinstance(self.editor, QSpinBox):
@@ -93,6 +116,32 @@ class _Row:
                 self.editor.setCurrentIndex(idx)
         finally:
             self.editor.blockSignals(False)
+
+    def apply_visual(self) -> None:
+        """Refresh the editor's background and the status marker to reflect
+        ``is_dirty`` and ``validation_severity``. Dirty wins over validation."""
+        if self.is_dirty:
+            self.editor.setStyleSheet(_DIRTY_QSS)
+            self.dirty_marker.setText("*")
+        else:
+            self.dirty_marker.setText("")
+            qss = _VALIDATION_QSS.get(self.validation_severity, "")
+            self.editor.setStyleSheet(qss)
+        icon = {"error": "✕", "warning": "⚠", "info": "ⓘ", "ok": "✓"}.get(
+            self.validation_severity, ""
+        )
+        colour = {
+            "error": "#c0392b", "warning": "#d68910",
+            "info": "#2874a6", "ok": "#27ae60",
+        }.get(self.validation_severity, "")
+        self.status_marker.setText(icon)
+        self.status_marker.setStyleSheet(
+            f"color: {colour}; font-weight: bold;" if colour else ""
+        )
+        if self.validation_titles:
+            self.status_marker.setToolTip("\n".join(self.validation_titles))
+        else:
+            self.status_marker.setToolTip("")
 
 
 def _make_editor(reg: RegisterDef, parent: QWidget) -> QWidget:
@@ -233,14 +282,18 @@ class _RegisterPanel(QWidget):
         dirty.setStyleSheet("color: #c0392b; font-weight: bold;")
         dirty.setMinimumWidth(12)
 
+        status = QLabel("", row_widget)
+        status.setMinimumWidth(16)
+
         row_layout.addWidget(label)
         row_layout.addWidget(editor, 1)
         row_layout.addWidget(units)
         row_layout.addWidget(dirty)
+        row_layout.addWidget(status)
 
         # Wire up the editor so the parent panel learns about edits and so
         # focus events bubble up as "this panel is active".
-        row = _Row(reg.sreg, is_pin, reg, label, editor, dirty)
+        row = _Row(reg.sreg, is_pin, reg, label, editor, dirty, status)
         self._wire_editor(row)
         # Track interaction by hooking focus events on the editor.
         editor.installEventFilter(_FocusReporter(self))
@@ -324,8 +377,8 @@ class _RegisterPanel(QWidget):
         if row is None:
             return
         self._dirty.add(key)
-        row.dirty_marker.setText("*")
-        row.editor.setStyleSheet(_DIRTY_QSS)
+        row.is_dirty = True
+        row.apply_visual()
 
     def _mark_clean(self, sreg: int, is_pin: bool) -> None:
         key = (sreg, is_pin)
@@ -333,8 +386,41 @@ class _RegisterPanel(QWidget):
         row = self._rows.get(key)
         if row is None:
             return
-        row.dirty_marker.setText("")
-        row.editor.setStyleSheet("")
+        row.is_dirty = False
+        row.apply_visual()
+
+    # ---------------------------------------------------------------- validation
+    def apply_validation(self, report: ValidationReport) -> None:
+        """Tint each row according to the worst issue affecting it.
+
+        Rows with no issues become "ok" green for a few seconds (the parent
+        tab can call clear_validation() on a timer to fade them).
+        """
+        # Worst severity per sreg, with rank order error > warning > info > ok
+        rank = {"error": 3, "warning": 2, "info": 1, "ok": 0, "": -1}
+        per_sreg = report.issues_by_sreg
+        for (sreg, is_pin), row in self._rows.items():
+            if is_pin:
+                # Pin registers aren't covered by current validation rules.
+                row.validation_severity = ""
+                row.validation_titles = ()
+                row.apply_visual()
+                continue
+            issues = per_sreg.get(sreg, [])
+            if not issues:
+                row.validation_severity = "ok"
+                row.validation_titles = ()
+            else:
+                worst = max(issues, key=lambda i: rank.get(i.severity, 0))
+                row.validation_severity = worst.severity
+                row.validation_titles = tuple(i.title for i in issues)
+            row.apply_visual()
+
+    def clear_validation(self) -> None:
+        for row in self._rows.values():
+            row.validation_severity = ""
+            row.validation_titles = ()
+            row.apply_visual()
 
 
 class _FocusReporter(QWidget):
@@ -378,6 +464,9 @@ class SettingsTab(QWidget):
         # Track the panel the user last interacted with — drives "Restore Defaults".
         self._active_panel: Optional[_RegisterPanel] = None
 
+        # Cached board name from radio_info, used by validation + preset filter.
+        self._board_name: str = ""
+
         self._build_ui()
         self._wire_radio()
         self._set_buttons_enabled(False)
@@ -394,6 +483,7 @@ class SettingsTab(QWidget):
 
         self._btn_load = QPushButton("Load Settings", self)
         self._btn_save = QPushButton("Save Settings", self)
+        self._btn_validate = QPushButton("Validate", self)
         self._btn_copy = QPushButton("Copy → Remote", self)
         self._btn_restore = QPushButton("Restore Defaults", self)
         self._btn_eeprom = QPushButton("Save EEPROM", self)
@@ -404,12 +494,20 @@ class SettingsTab(QWidget):
         self._btn_profiles.setText("Profiles")
         self._btn_profiles.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self._profiles_menu = QMenu(self._btn_profiles)
+        # Rebuilt every time the menu is shown so user-preset additions and
+        # board-detection updates are always reflected.
+        self._profiles_menu.aboutToShow.connect(self._populate_profiles_menu)
         self._populate_profiles_menu()
         self._btn_profiles.setMenu(self._profiles_menu)
+
+        # Compact summary label that shows the last validation tally.
+        self._validation_status = QLabel("", self)
+        self._validation_status.setStyleSheet("color: #555;")
 
         for btn in (
             self._btn_load,
             self._btn_save,
+            self._btn_validate,
             self._btn_copy,
             self._btn_restore,
             self._btn_eeprom,
@@ -418,6 +516,7 @@ class SettingsTab(QWidget):
         ):
             actions.addWidget(btn)
         actions.addWidget(self._btn_profiles)
+        actions.addWidget(self._validation_status)
         actions.addStretch(1)
         root.addLayout(actions)
 
@@ -443,6 +542,7 @@ class SettingsTab(QWidget):
         # ---- button wiring -------------------------------------------
         self._btn_load.clicked.connect(self._on_load_clicked)
         self._btn_save.clicked.connect(self._on_save_clicked)
+        self._btn_validate.clicked.connect(self._on_validate_clicked)
         self._btn_copy.clicked.connect(self._on_copy_to_remote_clicked)
         self._btn_restore.clicked.connect(self._on_restore_defaults_clicked)
         self._btn_eeprom.clicked.connect(self._on_save_eeprom_clicked)
@@ -450,22 +550,79 @@ class SettingsTab(QWidget):
         self._btn_factory.clicked.connect(self._on_factory_reset_clicked)
 
     def _populate_profiles_menu(self) -> None:
+        """(Re)build the Profiles dropdown.
+
+        Called once at init and again every time the menu is about to show,
+        so user-preset additions and board-detection updates appear without
+        the user having to restart the app.
+        """
         self._profiles_menu.clear()
-        for preset in BUILT_IN_PRESETS:
-            act = QAction(preset.name, self._profiles_menu)
-            act.setToolTip(preset.description)
-            # default arg pin captures the current preset by value.
-            act.triggered.connect(lambda _checked=False, p=preset: self._apply_profile(p))
-            self._profiles_menu.addAction(act)
+
+        category_layout = (
+            (CATEGORY_REGION,    "Region & frequency"),
+            (CATEGORY_USE_CASE,  "Use case"),
+            (CATEGORY_MODEL,     "Model defaults"),
+            (CATEGORY_MAXIMIZE,  "Maximize (combos)"),
+        )
+        for category, label in category_layout:
+            sub = self._profiles_menu.addMenu(label)
+            for preset in presets_by_category(category):
+                self._add_preset_action(sub, preset)
 
         self._profiles_menu.addSeparator()
-        load_act = QAction("Load profile from JSON…", self._profiles_menu)
+
+        # User presets — refreshed on every menu show.
+        user_sub = self._profiles_menu.addMenu("User presets")
+        user_presets = list_user_profiles()
+        if not user_presets:
+            empty = QAction("(no saved presets yet)", user_sub)
+            empty.setEnabled(False)
+            user_sub.addAction(empty)
+        else:
+            for preset in user_presets:
+                self._add_preset_action(user_sub, preset, is_user=True)
+            user_sub.addSeparator()
+            manage = QAction("Manage user presets…", user_sub)
+            manage.triggered.connect(self._on_manage_user_presets)
+            user_sub.addAction(manage)
+
+        save_user_act = QAction("Save current as user preset…", self._profiles_menu)
+        save_user_act.triggered.connect(self._on_save_user_preset)
+        self._profiles_menu.addAction(save_user_act)
+
+        self._profiles_menu.addSeparator()
+
+        load_act = QAction("Import preset from JSON…", self._profiles_menu)
         load_act.triggered.connect(self._on_profile_load)
         self._profiles_menu.addAction(load_act)
 
-        save_act = QAction("Save current local panel as profile…", self._profiles_menu)
+        save_act = QAction("Export current panel to JSON…", self._profiles_menu)
         save_act.triggered.connect(self._on_profile_save)
         self._profiles_menu.addAction(save_act)
+
+    def _add_preset_action(
+        self,
+        menu: QMenu,
+        preset: Profile,
+        *,
+        is_user: bool = False,
+    ) -> None:
+        applies = preset.matches_board(self._board_name)
+        text = preset.name if applies else f"{preset.name}  (n/a for {self._board_name})"
+        act = QAction(text, menu)
+        tip = preset.description
+        if not applies:
+            tip += f"  · This preset isn't tagged for {self._board_name}."
+        if preset.notes:
+            tip += f"\n\n{preset.notes}"
+        act.setToolTip(tip)
+        if not applies:
+            font = act.font()
+            font.setItalic(True)
+            act.setFont(font)
+        # default arg pins the current preset by value
+        act.triggered.connect(lambda _checked=False, p=preset: self._apply_profile(p))
+        menu.addAction(act)
 
     # ---------------------------------------------------------------- radio wiring
     def _wire_radio(self) -> None:
@@ -475,6 +632,15 @@ class SettingsTab(QWidget):
         self._radio.eeprom_saved.connect(self._on_eeprom_saved)
         self._radio.factory_reset_done.connect(self._on_factory_reset_done)
         self._radio.error.connect(self._on_radio_error)
+        # Track the connected radio's board name so presets can be filtered
+        # by applies_to and validation can apply model-specific rules.
+        self._radio.radio_info.connect(self._on_radio_info)
+
+    def _on_radio_info(self, info: object) -> None:
+        try:
+            self._board_name = str(info.get("board_name") or "")  # type: ignore[union-attr]
+        except Exception:
+            self._board_name = ""
 
     # ---------------------------------------------------------------- state handling
     def _on_state_changed(self, state: str) -> None:
@@ -493,6 +659,10 @@ class SettingsTab(QWidget):
             self._btn_profiles,
         ):
             btn.setEnabled(enabled)
+        # Validate is intentionally available even while disconnected — users
+        # may want to sanity-check a JSON profile they just loaded before
+        # connecting to a radio.
+        self._btn_validate.setEnabled(True)
 
     def _set_active_panel(self, panel: _RegisterPanel) -> None:
         self._active_panel = panel
@@ -630,6 +800,23 @@ class SettingsTab(QWidget):
 
     # ---------------------------------------------------------------- profile actions
     def _apply_profile(self, profile: Profile) -> None:
+        """Show the confirm-and-diff dialog, then stage values on the local panel."""
+        current_values: dict[int, int] = {}
+        for sreg in REGISTERS.keys():
+            v = self._local_panel.get_value(sreg, is_pin=False)
+            if v is not None:
+                current_values[sreg] = int(v)
+        dialog = ApplyPresetDialog(
+            profile,
+            current_values,
+            board_name=self._board_name,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._apply_profile_force(profile)
+
+    def _apply_profile_force(self, profile: Profile) -> None:
         applied = 0
         for sreg, value in profile.s_registers.items():
             reg = REGISTERS.get(int(sreg))
@@ -642,9 +829,138 @@ class SettingsTab(QWidget):
                 self._local_panel.set_value(int(sreg), int(value), is_pin=True)
                 applied += 1
         self._emit_status(
-            f"Applied profile '{profile.name}' to local panel ({applied} registers, unsaved).",
+            f"Applied preset '{profile.name}' to local panel "
+            f"({applied} registers, unsaved). Click Save Settings to commit.",
             6000,
         )
+
+    # ---------------------------------------------------------------- validation
+    def _on_validate_clicked(self) -> None:
+        s_params: dict[int, int] = {}
+        for sreg in REGISTERS.keys():
+            v = self._local_panel.get_value(sreg, is_pin=False)
+            if v is not None:
+                s_params[sreg] = int(v)
+        pin_params: dict[int, int] = {}
+        for sreg in PIN_REGISTERS.keys():
+            v = self._local_panel.get_value(sreg, is_pin=True)
+            if v is not None:
+                pin_params[sreg] = int(v)
+
+        report = validate_config(
+            s_params,
+            pin_params=pin_params,
+            board_name=self._board_name,
+            is_remote=False,
+        )
+        self._local_panel.apply_validation(report)
+
+        # Compact tally next to the action bar.
+        if report.overall == "ok":
+            self._validation_status.setText(
+                "<span style='color:#27ae60;'>✓ all rules pass</span>"
+            )
+        else:
+            parts: list[str] = []
+            if report.errors:
+                parts.append(f"<span style='color:#c0392b;'>✕ {len(report.errors)}</span>")
+            if report.warnings:
+                parts.append(f"<span style='color:#d68910;'>⚠ {len(report.warnings)}</span>")
+            if report.infos:
+                parts.append(f"<span style='color:#2874a6;'>ⓘ {len(report.infos)}</span>")
+            self._validation_status.setText(" ".join(parts))
+        self._validation_status.setTextFormat(Qt.TextFormat.RichText)
+
+        # Open summary dialog. Hook the "Apply fix" buttons.
+        dialog = ValidationDialog(report, parent=self)
+        dialog.apply_fix_requested.connect(self._on_apply_validation_fix)
+        dialog.exec()
+
+    def _on_apply_validation_fix(self, sreg: int, value: int) -> None:
+        self._local_panel.set_value(sreg, int(value), is_pin=False)
+        # Mark dirty so the user notices. Validation tints stay until next click.
+        self._local_panel.mark_dirty(sreg, is_pin=False)
+        self._emit_status(f"Staged fix: S{sreg} = {value} (unsaved)", 5000)
+
+    # ---------------------------------------------------------------- user preset save / manage
+    def _on_save_user_preset(self) -> None:
+        dialog = SavePresetDialog(
+            board_name=self._board_name,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        name = dialog.name()
+        if not name:
+            QMessageBox.warning(self, "Save preset", "Name cannot be empty.")
+            return
+
+        s_regs: dict[int, int] = {}
+        for sreg in sorted(REGISTERS.keys()):
+            reg = REGISTERS[sreg]
+            if reg.read_only:
+                continue
+            v = self._local_panel.get_value(sreg, is_pin=False)
+            if v is not None:
+                s_regs[sreg] = int(v)
+        pin_regs: dict[int, int] = {}
+        for sreg in sorted(PIN_REGISTERS.keys()):
+            v = self._local_panel.get_value(sreg, is_pin=True)
+            if v is not None:
+                pin_regs[sreg] = int(v)
+
+        profile = Profile(
+            name=name,
+            description=dialog.description(),
+            s_registers=s_regs,
+            pin_registers=pin_regs,
+            applies_to=dialog.applies_to(),
+            category="user",
+            notes=dialog.notes(),
+        )
+        try:
+            target = save_user_profile(profile)
+        except Exception as e:
+            QMessageBox.critical(self, "Save preset failed", str(e))
+            return
+        self._emit_status(f"Saved preset '{name}' to {target}", 5000)
+
+    def _on_manage_user_presets(self) -> None:
+        # Minimal manage flow: list + delete via QMessageBox confirms.
+        # A richer dialog can replace this later without affecting the API.
+        presets = list_user_profiles()
+        if not presets:
+            QMessageBox.information(self, "User presets", "No saved presets yet.")
+            return
+        names = "\n".join(f"  • {p.name}" for p in presets)
+        msg = QMessageBox(self)
+        msg.setWindowTitle("User presets")
+        msg.setIcon(QMessageBox.Icon.Information)
+        msg.setText(
+            f"Saved presets in {user_profile_dir()}:\n\n{names}\n\n"
+            "Edit or delete files directly in that folder, or use the dialog "
+            "below to remove one."
+        )
+        msg.setStandardButtons(QMessageBox.StandardButton.Close)
+        delete_btn = msg.addButton("Delete a preset…", QMessageBox.ButtonRole.ActionRole)
+        msg.exec()
+        if msg.clickedButton() is delete_btn:
+            choices = [p.name for p in presets]
+            target_name, ok = QInputDialog.getItem(
+                self, "Delete user preset",
+                "Select preset to delete:", choices, 0, False,
+            )
+            if not ok or not target_name:
+                return
+            target = next((p for p in presets if p.name == target_name), None)
+            if target is None:
+                return
+            if QMessageBox.question(
+                self, "Delete preset",
+                f"Delete '{target_name}' from {user_profile_dir()}?",
+            ) == QMessageBox.StandardButton.Yes:
+                if delete_user_profile(target):
+                    self._emit_status(f"Deleted preset '{target_name}'", 4000)
 
     def _on_profile_load(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
