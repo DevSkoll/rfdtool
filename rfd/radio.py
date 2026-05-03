@@ -48,10 +48,18 @@ class RadioCore:
     Methods raise :class:`RadioError` on protocol failure.  The caller is
     responsible for sequencing `enter_command_mode` / `exit_command_mode`
     around any block of AT operations — `Radio` does this automatically.
+
+    The :attr:`lock` is reentrant (so methods can call each other) and is
+    held for the duration of any I/O against the serial port.  Threads that
+    only want to read passthrough bytes from the port (e.g. the GUI-thread
+    read pump) should ``try_acquire(blocking=False)`` and skip the tick when
+    the lock is held — that way a long +++ bracket can't have its AT/OK
+    response stolen out of the input buffer by a concurrent reader.
     """
 
     def __init__(self, ser: _SerialLike) -> None:
         self._ser = ser
+        self.lock = threading.RLock()
 
     @property
     def serial(self) -> _SerialLike:
@@ -97,39 +105,61 @@ class RadioCore:
         self,
         bracket: proto.CommandModeBracket | None = None,
     ) -> bool:
+        """Send +++ and confirm command mode via three escalating probes.
+
+        SiK 3.x (RFD900X2) sometimes accepts the +++ but doesn't echo OK on
+        a bare ``AT`` follow-up. Trying ATI as a fallback catches that case.
+        """
         b = bracket or proto.CommandModeBracket()
-        try:
-            self._ser.reset_input_buffer()
-        except Exception:
-            pass
-        time.sleep(b.quiet_before)
-        self._ser.write(b.plus_string)
-        try:
-            self._ser.flush()
-        except Exception:
-            pass
-        time.sleep(b.quiet_after)
-        # Drain whatever +++ produced (often "OK"), then probe with AT to confirm.
-        deadline = time.monotonic() + b.reply_timeout
-        while time.monotonic() < deadline and self._ser.in_waiting > 0:
-            self._ser.read(self._ser.in_waiting)
-            time.sleep(0.01)
-        reply = self._send_collect(b"AT\r\n", timeout=b.reply_timeout)
-        return "OK" in reply.upper()
+        with self.lock:
+            try:
+                self._ser.reset_input_buffer()
+            except Exception:
+                pass
+            time.sleep(b.quiet_before)
+            self._ser.write(b.plus_string)
+            try:
+                self._ser.flush()
+            except Exception:
+                pass
+            time.sleep(b.quiet_after)
+            # Probe 1: post-+++ banner. Most SiK builds emit "OK\r\n" here.
+            deadline = time.monotonic() + b.reply_timeout
+            post_plus = bytearray()
+            while time.monotonic() < deadline:
+                n = self._ser.in_waiting
+                chunk = self._ser.read(n if n else 1)
+                if chunk:
+                    post_plus.extend(chunk)
+                    if b"OK" in post_plus.upper():
+                        return True
+                else:
+                    if post_plus:
+                        break
+                    time.sleep(0.01)
+            # Probe 2: AT.
+            if "OK" in self._send_collect(b"AT\r\n", timeout=b.reply_timeout).upper():
+                return True
+            # Probe 3: ATI — succeeds if the firmware returns its banner,
+            # which it does in command mode but never in passthrough.
+            reply = self._send_collect(b"ATI\r\n", timeout=b.reply_timeout).upper()
+            return any(tok in reply for tok in ("SIK", "RFD", "OK"))
 
     def exit_command_mode(self) -> bool:
-        reply = self._send_collect(proto.at_exit_command_mode(), timeout=1.0)
-        return "OK" in reply.upper()
+        with self.lock:
+            reply = self._send_collect(proto.at_exit_command_mode(), timeout=1.0)
+            return "OK" in reply.upper()
 
     # ---------------------------------------- parameter ops
     def read_params(self, *, remote: bool = False, timeout: float = 3.0) -> Ati5Result:
-        reply = self._send_collect(proto.at_read_params(remote=remote), timeout=timeout)
-        result = proto.parse_ati5(reply)
-        if not result.s_params:
-            raise RadioError(
-                f"no S-registers in {'remote' if remote else 'local'} ATI5 reply"
-            )
-        return result
+        with self.lock:
+            reply = self._send_collect(proto.at_read_params(remote=remote), timeout=timeout)
+            result = proto.parse_ati5(reply)
+            if not result.s_params:
+                raise RadioError(
+                    f"no S-registers in {'remote' if remote else 'local'} ATI5 reply"
+                )
+            return result
 
     def write_param(
         self,
@@ -145,57 +175,89 @@ class RadioCore:
             if pin
             else proto.at_set_param(sreg, value, remote=remote)
         )
-        reply = self._send_collect(cmd, timeout=timeout)
-        return "OK" in reply.upper()
+        with self.lock:
+            reply = self._send_collect(cmd, timeout=timeout)
+            return "OK" in reply.upper()
+
+    def write_params_batch(
+        self,
+        updates: list[tuple[int, int, bool, bool]],
+        *,
+        timeout: float = 1.0,
+    ) -> list[tuple[int, int, bool, bool, bool]]:
+        """Run many writes in a single locked block — caller is responsible
+        for being in command mode before calling. Returns the same tuples
+        with an `ok` flag appended.
+        """
+        results: list[tuple[int, int, bool, bool, bool]] = []
+        with self.lock:
+            for sreg, value, is_remote, is_pin in updates:
+                cmd = (
+                    proto.at_set_pin(sreg, value, remote=is_remote)
+                    if is_pin
+                    else proto.at_set_param(sreg, value, remote=is_remote)
+                )
+                reply = self._send_collect(cmd, timeout=timeout)
+                results.append((sreg, value, is_remote, is_pin, "OK" in reply.upper()))
+        return results
 
     def save_eeprom(self, *, remote: bool = False) -> bool:
-        reply = self._send_collect(proto.at_save_eeprom(remote=remote), timeout=2.0)
-        return "OK" in reply.upper()
+        with self.lock:
+            reply = self._send_collect(proto.at_save_eeprom(remote=remote), timeout=2.0)
+            return "OK" in reply.upper()
 
     def reboot(self, *, remote: bool = False) -> None:
         # Reboot disconnects us; no reply is expected.
-        self._ser.write(proto.at_reboot(remote=remote))
-        try:
-            self._ser.flush()
-        except Exception:
-            pass
+        with self.lock:
+            self._ser.write(proto.at_reboot(remote=remote))
+            try:
+                self._ser.flush()
+            except Exception:
+                pass
 
     def factory_reset(self, *, remote: bool = False) -> bool:
-        reply = self._send_collect(proto.at_factory_reset(remote=remote), timeout=2.0)
-        return "OK" in reply.upper()
+        with self.lock:
+            reply = self._send_collect(proto.at_factory_reset(remote=remote), timeout=2.0)
+            return "OK" in reply.upper()
 
     def send_at(self, command: str, *, timeout: float = 1.5) -> str:
         if not command.endswith(("\r", "\n")):
             command = command + "\r\n"
-        return self._send_collect(command.encode("ascii", errors="replace"), timeout=timeout)
+        with self.lock:
+            return self._send_collect(
+                command.encode("ascii", errors="replace"), timeout=timeout
+            )
 
     def poll_rssi(self, *, timeout: float = 1.0) -> RssiReport:
-        reply = self._send_collect(proto.at_rssi(), timeout=timeout)
-        return proto.parse_ati7(reply)
+        with self.lock:
+            reply = self._send_collect(proto.at_rssi(), timeout=timeout)
+            return proto.parse_ati7(reply)
 
     def identify(self, *, timeout: float = 1.0) -> dict:
         info: dict[str, object] = {}
-        info["banner"] = proto.parse_banner(
-            self._send_collect(proto.at_identify(), timeout=timeout)
-        )
-        info["board_id"] = proto.parse_int_response(
-            self._send_collect(proto.at_board_id(), timeout=timeout)
-        )
-        info["board_name"] = proto.board_name(info["board_id"])  # type: ignore[arg-type]
-        info["freq_id"] = proto.parse_int_response(
-            self._send_collect(proto.at_freq_id(), timeout=timeout)
-        )
-        info["bootloader_version"] = proto.parse_banner(
-            self._send_collect(proto.at_bootloader_version(), timeout=timeout)
-        )
+        with self.lock:
+            info["banner"] = proto.parse_banner(
+                self._send_collect(proto.at_identify(), timeout=timeout)
+            )
+            info["board_id"] = proto.parse_int_response(
+                self._send_collect(proto.at_board_id(), timeout=timeout)
+            )
+            info["board_name"] = proto.board_name(info["board_id"])  # type: ignore[arg-type]
+            info["freq_id"] = proto.parse_int_response(
+                self._send_collect(proto.at_freq_id(), timeout=timeout)
+            )
+            info["bootloader_version"] = proto.parse_banner(
+                self._send_collect(proto.at_bootloader_version(), timeout=timeout)
+            )
         return info
 
     def enter_bootloader(self) -> None:
-        self._ser.write(proto.at_bootloader())
-        try:
-            self._ser.flush()
-        except Exception:
-            pass
+        with self.lock:
+            self._ser.write(proto.at_bootloader())
+            try:
+                self._ser.flush()
+            except Exception:
+                pass
 
 
 # --------------------------------------------------------------------- async wrapper
@@ -248,6 +310,7 @@ class Radio(QObject):
     state_changed = Signal(str)
     params_loaded = Signal(object, bool)    # Ati5Result, is_remote
     write_result = Signal(int, int, bool, bool)  # sreg, value, ok, is_remote
+    write_batch_done = Signal(object)            # list of (sreg, value, is_remote, is_pin, ok)
     rssi_received = Signal(object)          # RssiReport
     rx_data = Signal(bytes)                 # raw passthrough bytes
     radio_info = Signal(object)             # dict
@@ -326,6 +389,12 @@ class Radio(QObject):
     def _tick_read_pump(self) -> None:
         if self._core is None or self._state != self.STATE_DATA:
             return
+        # Cooperative gate: if the worker thread holds the serial lock (because
+        # it's in the middle of a +++ bracket or AT exchange) skip this tick.
+        # Without this, the GUI thread would steal AT/OK responses out of the
+        # input buffer and command-mode entry would intermittently fail.
+        if not self._core.lock.acquire(blocking=False):
+            return
         try:
             ser = self._core.serial
             n = ser.in_waiting
@@ -343,6 +412,8 @@ class Radio(QObject):
                     self.mavlink_radio_status.emit(msg)
         except Exception as e:
             self.error.emit(f"read pump: {e}")
+        finally:
+            self._core.lock.release()
 
     def _set_state(self, s: str) -> None:
         if s != self._state:
@@ -468,6 +539,31 @@ class Radio(QObject):
             self.write_result.emit(sreg, value, ok, is_remote)
         except Exception as e:
             self.error.emit(f"write param: {e}")
+        finally:
+            self._back_to_data()
+
+    @_async
+    @Slot(object)
+    def write_params_batch(self, updates: list[tuple[int, int, bool, bool]]) -> None:
+        """Send many writes in a single command-mode bracket.
+
+        `updates` is a list of (sreg, value, is_remote, is_pin) tuples.  Emits
+        an individual `write_result` for each entry plus one `write_batch_done`
+        with the full results list at the end.  Stays in command mode until
+        the entire batch is processed, so a 27-write save takes one +++/ATO
+        round trip instead of 27.
+        """
+        if not updates:
+            return
+        if not self._ensure_command():
+            return
+        try:
+            results = self._core.write_params_batch(list(updates))  # type: ignore[union-attr]
+            for sreg, value, is_remote, is_pin, ok in results:
+                self.write_result.emit(sreg, value, ok, is_remote)
+            self.write_batch_done.emit(results)
+        except Exception as e:
+            self.error.emit(f"batch write: {e}")
         finally:
             self._back_to_data()
 

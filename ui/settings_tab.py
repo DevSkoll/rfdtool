@@ -512,8 +512,12 @@ class SettingsTab(QWidget):
     def _on_save_clicked(self) -> None:
         self._save_pending.clear()
         self._save_failures = 0
-        attempted = 0
         skipped: list[str] = []
+        # Batch local and remote writes into one round-trip each — staying in
+        # command mode for the whole set is dramatically faster than doing
+        # one +++/ATO bracket per register, and also avoids serial races.
+        local_batch: list[tuple[int, int, bool, bool]] = []
+        remote_batch: list[tuple[int, int, bool, bool]] = []
 
         for panel in (self._local_panel, self._remote_panel):
             is_remote = panel.is_remote()
@@ -525,17 +529,24 @@ class SettingsTab(QWidget):
                     skipped.append(reason)
                     continue
                 self._save_pending.add((sreg, is_remote, is_pin))
-                self._radio.write_param(sreg, value, is_remote, is_pin)
-                attempted += 1
+                (remote_batch if is_remote else local_batch).append(
+                    (sreg, value, is_remote, is_pin)
+                )
 
         if skipped:
             for reason in skipped:
                 self._emit_status(reason, 6000)
 
+        attempted = len(local_batch) + len(remote_batch)
         if attempted == 0:
             if not skipped:
                 self._emit_status("No changes to save.", 4000)
             return
+
+        if local_batch:
+            self._radio.write_params_batch(local_batch)
+        if remote_batch:
+            self._radio.write_params_batch(remote_batch)
         self._emit_status(f"Saving {attempted} register(s)…", 3000)
 
     def _on_copy_to_remote_clicked(self) -> None:
