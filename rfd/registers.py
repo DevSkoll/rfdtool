@@ -218,13 +218,18 @@ REGISTERS: dict[int, RegisterDef] = {
         label="Number of hopping channels",
         tooltip="Number of frequency-hopping channels spread across "
                 "MIN_FREQ..MAX_FREQ. More channels improve coexistence with "
-                "other users of the band.",
+                "other users of the band. The original SiK firmware capped "
+                "this at 50; RFDesign's newer firmwares (especially -US/-EU "
+                "SKUs that lock at 51) accept higher values up to the uint8 "
+                "hardware ceiling.",
         kind="int",
         minimum=1,
-        maximum=50,
+        maximum=255,
         enum=None,
         default=20,
         units=None,
+        variant_notes="Range widened to 1..255; the per-region regulatory "
+                      "minimum is enforced separately by the validator (R9).",
     ),
     11: RegisterDef(
         sreg=11,

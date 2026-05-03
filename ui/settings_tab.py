@@ -106,7 +106,16 @@ class _Row:
         self.editor.blockSignals(True)
         try:
             if isinstance(self.editor, QSpinBox):
-                self.editor.setValue(int(value))
+                v = int(value)
+                # Auto-expand the spinbox range if the radio reports a value
+                # outside our current bounds (e.g. newer firmware widening a
+                # register that used to cap lower). Without this the QSpinBox
+                # silently clips and the user sees a stale display value.
+                if v < self.editor.minimum():
+                    self.editor.setMinimum(v)
+                if v > self.editor.maximum():
+                    self.editor.setMaximum(v)
+                self.editor.setValue(v)
             elif isinstance(self.editor, QComboBox):
                 idx = self.editor.findData(int(value))
                 if idx < 0:

@@ -150,7 +150,10 @@ def test_s8_s9_freq_range_and_no_default() -> None:
 
 def test_s10_num_channels() -> None:
     s10 = REGISTERS[10]
-    assert s10.minimum == 1 and s10.maximum == 50
+    # Range widened from the original SiK 1..50 to the uint8 hardware ceiling
+    # because RFDesign's newer firmwares (e.g. -US SKUs locked at 51) accept
+    # values above 50. Per-region regulatory minimums are enforced by R9.
+    assert s10.minimum == 1 and s10.maximum == 255
     assert s10.default == 20
 
 
