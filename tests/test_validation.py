@@ -221,6 +221,71 @@ def test_R18_default_netid():
                for i in report.issues)
 
 
+# ------------------------------------------------------------ R19 firmware lockdown
+
+_LOCKED_BANNER = "RFD SiK 3.57 on RFD900X2-US"
+
+
+def test_R19_flags_lockdown_change_against_radio():
+    """User wants S9=928000 but the radio's locked at 915000 → warning + suggested revert."""
+    intended = {8: 902000, 9: 928000, 10: 50, 11: 100}
+    current  = {8: 902000, 9: 915000, 10: 51, 11: 100}
+    report = validate_config(
+        intended,
+        firmware_banner=_LOCKED_BANNER,
+        current_values=current,
+    )
+    locked_warns = [i for i in report.warnings if "firmware-locked" in i.title]
+    # Expect S9 and S10 (intended differ from current); S8 and S11 don't differ
+    sregs = sorted({s for i in locked_warns for s in i.sregs})
+    assert sregs == [9, 10]
+    # The fix should suggest the radio's actual value
+    s9_issue = next(i for i in locked_warns if 9 in i.sregs)
+    assert s9_issue.suggested_value == 915000
+    s10_issue = next(i for i in locked_warns if 10 in i.sregs)
+    assert s10_issue.suggested_value == 51
+
+
+def test_R19_silent_when_intended_matches_current():
+    """If the user's value already matches what the radio has, no warning."""
+    cfg = {8: 902000, 9: 915000, 10: 51, 2: 64, 15: 0}
+    report = validate_config(
+        cfg,
+        firmware_banner=_LOCKED_BANNER,
+        current_values=dict(cfg),
+    )
+    assert not any("firmware-locked" in i.title for i in report.issues)
+
+
+def test_R19_skipped_for_unknown_banner():
+    """No banner / non-matching banner → R19 doesn't fire."""
+    intended = {9: 928000}
+    current  = {9: 915000}
+    # Empty banner
+    rep = validate_config(intended, current_values=current)
+    assert not any("firmware-locked" in i.title for i in rep.issues)
+    # Banner that doesn't match any lockdown
+    rep = validate_config(
+        intended,
+        firmware_banner="RFD SiK 1.7 on RFD900p",
+        current_values=current,
+    )
+    assert not any("firmware-locked" in i.title for i in rep.issues)
+
+
+def test_R19_skipped_on_remote_panel():
+    """Remote validation skips R19 because the remote board isn't reliably known."""
+    intended = {9: 928000}
+    current  = {9: 915000}
+    rep = validate_config(
+        intended,
+        firmware_banner=_LOCKED_BANNER,
+        current_values=current,
+        is_remote=True,
+    )
+    assert not any("firmware-locked" in i.title for i in rep.issues)
+
+
 # ------------------------------------------------------------ integration
 
 def test_valid_us_config_no_errors():

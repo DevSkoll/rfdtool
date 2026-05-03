@@ -25,7 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Iterable
 
-from . import registers
+from . import registers, regions
 from .regions import (
     Region,
     detect_region,
@@ -429,6 +429,51 @@ def _rule_18(s_params: dict[int, int]) -> list[ValidationIssue]:
     )]
 
 
+def _rule_19(
+    s_params: dict[int, int],
+    current_values: dict[int, int],
+    firmware_banner: str,
+) -> list[ValidationIssue]:
+    """R19 — firmware-locked register: pre-flight detection.
+
+    Some RFDesign firmware variants (notably "-US"/"-EU" SKUs) factory-lock
+    a subset of S-registers to keep the radio inside its certification
+    envelope.  The radio replies "ERROR" to *any* attempted change of those
+    registers.
+
+    For each locked sreg, if the user's intended value differs from the
+    radio's current value, raise a warning so the user knows the change
+    won't survive a Save Settings.
+    """
+    locked = regions.firmware_lockdown(firmware_banner)
+    if not locked:
+        return []
+    label = regions.lockdown_label(firmware_banner) or "this firmware variant"
+    out: list[ValidationIssue] = []
+    for sreg in sorted(locked):
+        if sreg not in s_params or sreg not in current_values:
+            continue
+        intended = s_params[sreg]
+        actual = current_values[sreg]
+        if intended == actual:
+            continue
+        out.append(ValidationIssue(
+            severity="warning",
+            sregs=(sreg,),
+            title=f"S{sreg} is firmware-locked on {label}",
+            detail=(
+                f"Your intended value ({intended}) differs from the radio's "
+                f"current value ({actual}). RFDesign locks frequency-hopping "
+                f"and air-rate parameters on certified region SKUs to keep "
+                f"the radio inside its FCC/ETSI/ACMA test envelope. Save will "
+                f"fail for this register; revert to {actual} or leave it as-is."
+            ),
+            fix_hint=f"Revert S{sreg} to the radio's locked value ({actual}).",
+            suggested_value=actual,
+        ))
+    return out
+
+
 # --------------------------------------------------------------------- entry point
 
 def validate_config(
@@ -437,15 +482,23 @@ def validate_config(
     board_name: str = "",
     pin_params: dict[int, int] | None = None,
     is_remote: bool = False,
+    firmware_banner: str = "",
+    current_values: dict[int, int] | None = None,
 ) -> ValidationReport:
     """Run every rule in canonical order and return a :class:`ValidationReport`.
 
+    ``firmware_banner`` and ``current_values`` are optional inputs needed by
+    R19 (firmware-lockdown detection).  Pass the radio's ATI banner string
+    and the most recent values read off the radio (typically from the last
+    ``params_loaded`` event).  Without them R19 is silently skipped.
+
     Set ``is_remote=True`` when validating the *remote* radio's panel: the
     partner's exact board model isn't reliably known, so model-specific
-    rules (R4, R5, R7) are skipped.
+    rules (R4, R5, R7) are skipped.  R19 is also skipped on the remote.
     """
     # Deliberately do not mutate caller's dicts.
     s_params = dict(s_params)
+    current_values = dict(current_values or {})
 
     region: Region | None = None
     if 8 in s_params and 9 in s_params:
@@ -470,6 +523,8 @@ def validate_config(
     issues.extend(_rule_16(s_params))
     issues.extend(_rule_17(s_params))
     issues.extend(_rule_18(s_params))
+    if not is_remote:
+        issues.extend(_rule_19(s_params, current_values, firmware_banner))
 
     return ValidationReport(
         issues=tuple(issues),

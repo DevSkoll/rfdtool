@@ -457,6 +457,7 @@ class SettingsTab(QWidget):
         # Multi-write tracking for "Save Settings".
         self._save_pending: set[tuple[int, bool, bool]] = set()  # (sreg, is_remote, is_pin)
         self._save_failures: int = 0
+        self._save_rejected: list[tuple[str, int, int]] = []  # (label, sreg, value) for regs the radio said ERROR to
 
         # EEPROM save tracking.
         self._eeprom_pending: set[bool] = set()  # set of is_remote flags
@@ -464,8 +465,14 @@ class SettingsTab(QWidget):
         # Track the panel the user last interacted with — drives "Restore Defaults".
         self._active_panel: Optional[_RegisterPanel] = None
 
-        # Cached board name from radio_info, used by validation + preset filter.
+        # Cached board name + ATI banner from radio_info.  Both fed into
+        # validate_config: board_name powers model-specific rules, banner
+        # powers firmware-lockdown detection (R19).
         self._board_name: str = ""
+        self._firmware_banner: str = ""
+        # The radio's last-known values.  Populated by params_loaded events;
+        # R19 needs this to detect "user wants X but radio is locked at Y".
+        self._radio_current_values: dict[int, int] = {}
 
         self._build_ui()
         self._wire_radio()
@@ -639,8 +646,10 @@ class SettingsTab(QWidget):
     def _on_radio_info(self, info: object) -> None:
         try:
             self._board_name = str(info.get("board_name") or "")  # type: ignore[union-attr]
+            self._firmware_banner = str(info.get("banner") or "")  # type: ignore[union-attr]
         except Exception:
             self._board_name = ""
+            self._firmware_banner = ""
 
     # ---------------------------------------------------------------- state handling
     def _on_state_changed(self, state: str) -> None:
@@ -682,6 +691,7 @@ class SettingsTab(QWidget):
     def _on_save_clicked(self) -> None:
         self._save_pending.clear()
         self._save_failures = 0
+        self._save_rejected.clear()
         skipped: list[str] = []
         # Batch local and remote writes into one round-trip each — staying in
         # command mode for the whole set is dramatically faster than doing
@@ -852,6 +862,8 @@ class SettingsTab(QWidget):
             pin_params=pin_params,
             board_name=self._board_name,
             is_remote=False,
+            firmware_banner=self._firmware_banner,
+            current_values=self._radio_current_values,
         )
         self._local_panel.apply_validation(report)
 
@@ -1030,6 +1042,13 @@ class SettingsTab(QWidget):
         panel.apply_values(s_params, pin_params)
         panel.mark_all_clean()
 
+        # Cache the LOCAL snapshot so the validator's R19 (firmware lockdown
+        # detection) can compare user-intended values against what the radio
+        # currently has. We don't bother caching the remote values because
+        # R19 is skipped for is_remote=True anyway.
+        if not is_remote:
+            self._radio_current_values = dict(s_params)
+
         side = "remote" if is_remote else "local"
         self._emit_status(f"Loaded {side} settings ({len(s_params)} registers)", 5000)
 
@@ -1063,17 +1082,29 @@ class SettingsTab(QWidget):
             panel.mark_clean(sreg, is_pin)
         else:
             self._save_failures += 1
-            self._emit_status(f"Write failed: {prefix}{sreg} = {value}", 6000)
+            self._save_rejected.append((f"{prefix}{sreg}", sreg, value))
 
         if matched and not self._save_pending:
             if self._save_failures == 0:
                 self._emit_status("All changes saved.", 5000)
             else:
-                self._emit_status(
-                    f"Save complete with {self._save_failures} failure(s).",
-                    7000,
-                )
+                self._announce_save_failures()
             self._save_failures = 0
+            self._save_rejected.clear()
+
+    def _announce_save_failures(self) -> None:
+        """Build a single status-bar line naming the rejected registers.
+
+        We deliberately don't pop a modal dialog here — the canonical place
+        to learn about firmware-locked registers is the Validate button,
+        which previews them *before* the user clicks Save.
+        """
+        labels = ", ".join(label for label, _sreg, _val in self._save_rejected)
+        msg = (
+            f"Save complete — {self._save_failures} register(s) rejected by the radio: {labels}. "
+            "Click Validate for details."
+        )
+        self._emit_status(msg, 12000)
 
     def _on_eeprom_saved(self, ok: bool, is_remote: bool) -> None:
         side = "remote" if is_remote else "local"

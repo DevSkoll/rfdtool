@@ -118,3 +118,35 @@ def test_model_family_lookup():
     assert model_family("RFD900p").code == "8051"
     assert model_family("RFD900x").code == "stm32_v1"
     assert model_family("nope") is None
+
+
+# -------------------------------------------------- firmware lockdowns
+def test_firmware_lockdown_us_x2():
+    from rfd.regions import firmware_lockdown
+    locked = firmware_lockdown("RFD SiK 3.57 on RFD900X2-US")
+    assert locked == frozenset({2, 8, 9, 10, 15})
+
+
+def test_firmware_lockdown_us_x():
+    from rfd.regions import firmware_lockdown
+    assert firmware_lockdown("SiK 2.4 on RFD900X-US") == frozenset({2, 8, 9, 10, 15})
+
+
+def test_firmware_lockdown_eu_variants():
+    from rfd.regions import firmware_lockdown
+    assert firmware_lockdown("RFD SiK 3.0 on RFD900X2-EU") == frozenset({2, 8, 9, 10, 15})
+    assert firmware_lockdown("RFD SiK 2.7 on RFD900X-EU")  == frozenset({2, 8, 9, 10, 15})
+
+
+def test_firmware_lockdown_unknown_banner_returns_empty():
+    from rfd.regions import firmware_lockdown
+    # Plain 8051 banner — no lockdown
+    assert firmware_lockdown("RFD SiK 1.7 on RFD900p") == frozenset()
+    # Empty
+    assert firmware_lockdown("") == frozenset()
+
+
+def test_lockdown_label():
+    from rfd.regions import lockdown_label
+    assert lockdown_label("RFD SiK 3.57 on RFD900X2-US") == "RFD900X2-US"
+    assert lockdown_label("nothing") == ""

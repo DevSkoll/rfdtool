@@ -172,6 +172,55 @@ MODEL_FAMILIES: list[ModelFamily] = [
 ]
 
 
+# --------------------------------------------------------------------- firmware lockdowns
+# Some RFDesign firmware variants ship with frequency-hopping and air-rate
+# parameters factory-locked, so the radio stays inside its regulatory
+# certification.  Any AT write to these registers returns "ERROR".  We use
+# this map to pre-flight which proposed changes the radio will reject so the
+# user sees the warning *before* clicking Save.
+#
+# Structure: list of (banner-substring, frozenset of locked S-regs).  First
+# match wins.  Substring match is case-insensitive.
+FIRMWARE_LOCKDOWNS: list[tuple[str, frozenset[int]]] = [
+    # RFD900x2-US — confirmed via direct serial probing on hardware:
+    # S2=64, S8=902000, S9=915000, S10=51, S15=0 are all rejected on change.
+    ("RFD900X2-US", frozenset({2, 8, 9, 10, 15})),
+    # RFD900x-US — same firmware family, same expected lockdown set.
+    ("RFD900X-US", frozenset({2, 8, 9, 10, 15})),
+    # RFD900x2-EU / RFD900x-EU — RFDesign's EU SKUs lock to ETSI sub-bands;
+    # the parameter set is the same as the US lockdown.  (Marked as expected;
+    # update once verified on hardware.)
+    ("RFD900X2-EU", frozenset({2, 8, 9, 10, 15})),
+    ("RFD900X-EU",  frozenset({2, 8, 9, 10, 15})),
+]
+
+
+def firmware_lockdown(banner: str) -> frozenset[int]:
+    """Return the set of S-registers known to be firmware-locked on the
+    radio whose ATI banner contains the matched substring.
+
+    Empty banner or unknown variant → empty set (no rule applied).
+    """
+    if not banner:
+        return frozenset()
+    upper = banner.upper()
+    for substr, locked in FIRMWARE_LOCKDOWNS:
+        if substr.upper() in upper:
+            return locked
+    return frozenset()
+
+
+def lockdown_label(banner: str) -> str:
+    """Return a short human label for the locked SKU in `banner`, or ''."""
+    if not banner:
+        return ""
+    upper = banner.upper()
+    for substr, _ in FIRMWARE_LOCKDOWNS:
+        if substr.upper() in upper:
+            return substr
+    return ""
+
+
 def model_family(board_name: str) -> ModelFamily | None:
     if not board_name:
         return None
