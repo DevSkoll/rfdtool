@@ -97,39 +97,62 @@ def at_bootloader_version() -> bytes:
 
 
 # --------------------------------------------------------------------- ATI5 parser
+# RFDesign 3.x parameter names contain `/` (e.g. ``GPI1_1R/CIN``) and
+# possibly other punctuation, so the name group accepts any non-`=`
+# non-whitespace run.  The trailing value is signed integer only.
 ATI5_LINE = re.compile(
-    r"^\s*S(\d+)\s*:\s*([A-Z0-9_]+)\s*=\s*(-?\d+)\s*$",
+    r"^\s*S(\d+)\s*:\s*(\S+?)\s*=\s*(-?\d+)\s*$",
     re.IGNORECASE,
 )
 ATI5_PIN_LINE = re.compile(
-    r"^\s*R(\d+)\s*:\s*([A-Z0-9_]+)\s*=\s*(-?\d+)\s*$",
+    r"^\s*R(\d+)\s*:\s*(\S+?)\s*=\s*(-?\d+)\s*$",
     re.IGNORECASE,
 )
 
 
 @dataclass(frozen=True)
 class Ati5Result:
+    """Parsed ATI5 output.
+
+    ``s_params`` / ``pin_params`` map sreg → value as before. ``s_names`` /
+    ``pin_names`` map sreg → the parameter name the firmware reported, so
+    callers can build a name-keyed view of the configuration without
+    assuming the canonical SiK layout.
+    """
     s_params: dict[int, int]
     pin_params: dict[int, int]
+    s_names: dict[int, str]
+    pin_names: dict[int, str]
 
 
 def parse_ati5(text: str) -> Ati5Result:
-    """Parse ATI5 output into S-register and R-register dicts.
+    """Parse ATI5 output into S-register and R-register dicts (with names).
 
     Tolerates the echoed command, blank lines, mixed line endings, and the
     trailing prompt.  Lines that don't match either pattern are ignored.
     """
     s_params: dict[int, int] = {}
     pin_params: dict[int, int] = {}
+    s_names: dict[int, str] = {}
+    pin_names: dict[int, str] = {}
     for line in text.replace("\r", "").splitlines():
         m = ATI5_LINE.match(line)
         if m:
-            s_params[int(m.group(1))] = int(m.group(3))
+            sreg = int(m.group(1))
+            s_params[sreg] = int(m.group(3))
+            s_names[sreg] = m.group(2)
             continue
         m = ATI5_PIN_LINE.match(line)
         if m:
-            pin_params[int(m.group(1))] = int(m.group(3))
-    return Ati5Result(s_params=s_params, pin_params=pin_params)
+            sreg = int(m.group(1))
+            pin_params[sreg] = int(m.group(3))
+            pin_names[sreg] = m.group(2)
+    return Ati5Result(
+        s_params=s_params,
+        pin_params=pin_params,
+        s_names=s_names,
+        pin_names=pin_names,
+    )
 
 
 # --------------------------------------------------------------------- ATI7 parser

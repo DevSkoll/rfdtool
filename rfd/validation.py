@@ -1,29 +1,21 @@
-"""Configuration validator for SiK / RFD900 S-register sets.
+"""Higher-level configuration validation rules for SiK-family radios.
 
-Pure-logic checker that turns a dict of S-register values (and optional pin
-register values) into a :class:`ValidationReport` of
-:class:`ValidationIssue` records the UI uses to tint individual rows and
-to drive a summary dialog.
+Operates in **parameter-name space** rather than sreg-number space, so the
+same rule fires correctly regardless of which sreg a particular firmware
+puts a parameter at.  RFDesign's SiK 3.x reorders S13/S14/S15 relative to
+canonical SiK; both layouts go through the same rules here as long as the
+caller passes the firmware's ``sreg → name`` map (typically built from the
+firmware's own ``ATI5`` response).
 
-The validator composes 18 small rule functions (``_rule_1`` ..
-``_rule_18``).  Each returns a list of issues; ``validate_config`` simply
-concatenates them in a fixed order so the report can be reproduced
-deterministically.
-
-Two existing modules supply the ground truth:
-
-* :mod:`rfd.registers` defines the per-register schema and the basic
-  range/enum/bool validator used by rule R1.
-* :mod:`rfd.regions` defines the regulatory regions (used by R8-R12) and
-  the per-board TX-power and firmware-family lookups (used by R4 and R7).
-
-There is intentionally no Qt or serial I/O in this module: it is safe to
-import from both the protocol layer and the UI.
+The validator composes 19 small rule functions (``_rule_1`` ..
+``_rule_19``).  Each returns a list of issues; ``validate_config`` simply
+chains them.  ``ValidationIssue.sregs`` is still populated for the
+existing UI; ``param_names`` carries the canonical name of each register
+the issue concerns.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable
 
 from . import registers, regions
 from .regions import (
@@ -43,12 +35,13 @@ _TELEMETRY_AIR_RATES: frozenset[int] = frozenset({64, 96, 128, 192, 200, 250})
 @dataclass(frozen=True)
 class ValidationIssue:
     severity: str                          # "error" | "warning" | "info"
-    sregs: tuple[int, ...]                 # registers this issue concerns
+    sregs: tuple[int, ...]                 # firmware-specific sreg numbers
     title: str                             # short label
     detail: str                            # 1-2 sentences of explanation
     fix_hint: str = ""                     # human-readable suggestion
-    suggested_value: int | None = None     # for click-to-fix (paired with sregs[0])
+    suggested_value: int | None = None     # for click-to-fix
     citation: str = ""                     # regulatory citation if applicable
+    param_names: tuple[str, ...] = ()      # canonical parameter names
 
 
 @dataclass(frozen=True)
@@ -93,61 +86,118 @@ class ValidationReport:
                 out.setdefault(sreg, []).append(issue)
         return out
 
+    @property
+    def issues_by_name(self) -> dict[str, list[ValidationIssue]]:
+        """Index issues by canonical parameter name (where known)."""
+        out: dict[str, list[ValidationIssue]] = {}
+        for issue in self.issues:
+            for name in issue.param_names:
+                out.setdefault(name, []).append(issue)
+        return out
+
+
+# --------------------------------------------------------------------- helpers
+def _sreg_label(sreg: int | None, name: str) -> str:
+    return f"S{sreg} {name}" if sreg is not None else name
+
+
+def _make_issue(
+    *,
+    severity: str,
+    names: tuple[str, ...],
+    name_to_sreg: dict[str, int],
+    title: str,
+    detail: str,
+    fix_hint: str = "",
+    suggested_value: int | None = None,
+    citation: str = "",
+) -> ValidationIssue:
+    sregs = tuple(name_to_sreg[n] for n in names if n in name_to_sreg)
+    return ValidationIssue(
+        severity=severity,
+        sregs=sregs,
+        title=title,
+        detail=detail,
+        fix_hint=fix_hint,
+        suggested_value=suggested_value,
+        citation=citation,
+        param_names=names,
+    )
+
 
 # --------------------------------------------------------------------- rules
+# Each rule operates on a name-keyed view of the configuration.  Issues
+# carry both the canonical name(s) and the sreg numbers (translated via
+# `name_to_sreg`) so the UI can tint the right rows regardless of which
+# sreg the firmware happens to use for that parameter.
 
-def _rule_1(s_params: dict[int, int]) -> list[ValidationIssue]:
-    """R1 — per-register range / enum / bool validation.
+def _rule_1(
+    by_name: dict[str, int],
+    name_to_sreg: dict[str, int],
+) -> list[ValidationIssue]:
+    """R1 — per-parameter range / enum / bool validation.
 
-    Read-only registers (S0 FORMAT) are skipped: they're informational, the
-    user isn't writing them, and the per-register validator returns "is
-    read-only" for any value of theirs.
+    Read-only parameters (e.g. FORMAT) are skipped — the user isn't
+    writing them, and the per-name validator returns "is read-only" for
+    any value of theirs.  Names absent from the catalog are accepted (the
+    firmware says they exist; we don't have an opinion on their range).
     """
     issues: list[ValidationIssue] = []
-    for sreg in sorted(s_params):
-        reg = registers.REGISTERS.get(sreg)
-        if reg is not None and reg.read_only:
+    for name in sorted(by_name):
+        spec = registers.get_spec(name)
+        if spec is not None and spec.read_only:
             continue
-        value = s_params[sreg]
-        ok, reason = registers.validate(sreg, value)
+        value = by_name[name]
+        ok, reason = registers.validate_value(name, value)
         if not ok:
+            sreg = name_to_sreg.get(name)
             issues.append(ValidationIssue(
                 severity="error",
-                sregs=(sreg,),
-                title=f"S{sreg}: invalid value {value}",
+                sregs=(sreg,) if sreg is not None else (),
+                title=f"{_sreg_label(sreg, name)}: invalid value {value}",
                 detail=reason,
+                param_names=(name,),
             ))
     return issues
 
 
-def _rule_2(s_params: dict[int, int]) -> list[ValidationIssue]:
+def _rule_2(
+    by_name: dict[str, int],
+    name_to_sreg: dict[str, int],
+) -> list[ValidationIssue]:
     """R2 — frequency ordering: MIN_FREQ must be strictly less than MAX_FREQ."""
-    if 8 not in s_params or 9 not in s_params:
+    if "MIN_FREQ" not in by_name or "MAX_FREQ" not in by_name:
         return []
-    s8, s9 = s_params[8], s_params[9]
-    if s8 >= s9:
-        return [ValidationIssue(
+    if by_name["MIN_FREQ"] >= by_name["MAX_FREQ"]:
+        return [_make_issue(
             severity="error",
-            sregs=(8, 9),
+            names=("MIN_FREQ", "MAX_FREQ"),
+            name_to_sreg=name_to_sreg,
             title="MIN_FREQ ≥ MAX_FREQ",
-            detail="S8 must be strictly less than S9; the radio will refuse "
-                   "the configuration.",
+            detail="MIN_FREQ must be strictly less than MAX_FREQ; the "
+                   "radio will refuse the configuration.",
         )]
     return []
 
 
-def _rule_3(s_params: dict[int, int]) -> list[ValidationIssue]:
+def _rule_3(
+    by_name: dict[str, int],
+    name_to_sreg: dict[str, int],
+) -> list[ValidationIssue]:
     """R3 — channel spacing must be at least 50 kHz."""
-    if not all(k in s_params for k in (8, 9, 10)):
+    if not all(n in by_name for n in ("MIN_FREQ", "MAX_FREQ", "NUM_CHANNELS")):
         return []
-    s8, s9, s10 = s_params[8], s_params[9], s_params[10]
+    s8 = by_name["MIN_FREQ"]
+    s9 = by_name["MAX_FREQ"]
+    s10 = by_name["NUM_CHANNELS"]
     if s10 <= 0 or s8 >= s9:
         return []
     spacing = (s9 - s8) / s10
     if spacing < 50:
-        return [ValidationIssue(
+        return [_make_issue(
             severity="warning",
-            sregs=(8, 9, 10),
+            names=("MIN_FREQ", "MAX_FREQ", "NUM_CHANNELS"),
+            name_to_sreg=name_to_sreg,
             title="Channels too narrow",
             detail=(
                 f"NUM_CHANNELS={s10} across {s9 - s8} kHz gives "
@@ -157,38 +207,43 @@ def _rule_3(s_params: dict[int, int]) -> list[ValidationIssue]:
     return []
 
 
-def _rule_4(s_params: dict[int, int], board_name: str) -> list[ValidationIssue]:
+def _rule_4(
+    by_name: dict[str, int],
+    name_to_sreg: dict[str, int],
+    board_name: str,
+) -> list[ValidationIssue]:
     """R4 — TX power must not exceed the board's hardware ceiling."""
-    if 4 not in s_params:
+    if "TXPOWER" not in by_name:
         return []
     cap = model_max_txpower(board_name)
     if cap is None:
         return []
-    s4 = s_params[4]
+    s4 = by_name["TXPOWER"]
     if s4 > cap:
-        return [ValidationIssue(
+        return [_make_issue(
             severity="error",
-            sregs=(4,),
+            names=("TXPOWER",),
+            name_to_sreg=name_to_sreg,
             title=f"TXPOWER {s4} dBm exceeds {board_name} maximum ({cap} dBm)",
             detail="The radio chip clips silently above this — the actual "
                    "output won't match the configured value.",
-            fix_hint=f"Set S4 to {cap} or lower.",
+            fix_hint=f"Set TXPOWER to {cap} or lower.",
             suggested_value=cap,
         )]
     return []
 
 
-def _rule_5(s_params: dict[int, int]) -> list[ValidationIssue]:
-    """R5 — 1 W output requires more current than a typical UART supplies.
-
-    Info-not-warning: 30 dBm is legal in many regions and intentional on
-    capable boards; we surface it so the integrator double-checks power.
-    """
-    if s_params.get(4) != 30:
+def _rule_5(
+    by_name: dict[str, int],
+    name_to_sreg: dict[str, int],
+) -> list[ValidationIssue]:
+    """R5 — 1 W output requires more current than a typical UART supplies."""
+    if by_name.get("TXPOWER") != 30:
         return []
-    return [ValidationIssue(
+    return [_make_issue(
         severity="info",
-        sregs=(4,),
+        names=("TXPOWER",),
+        name_to_sreg=name_to_sreg,
         title="1 W output requires external power",
         detail="30 dBm peak draws ≈2 A briefly; the typical autopilot "
                "telemetry port can't supply this. Use a separate ≥2 A "
@@ -196,56 +251,69 @@ def _rule_5(s_params: dict[int, int]) -> list[ValidationIssue]:
     )]
 
 
-def _rule_7(s_params: dict[int, int], board_name: str) -> list[ValidationIssue]:
+def _rule_7(
+    by_name: dict[str, int],
+    name_to_sreg: dict[str, int],
+    board_name: str,
+) -> list[ValidationIssue]:
     """R7 — newer air rates (200/224 kbps) aren't in the 8051 SiK table."""
-    if 2 not in s_params:
+    if "AIR_SPEED" not in by_name:
         return []
-    s2 = s_params[2]
+    s2 = by_name["AIR_SPEED"]
     if s2 not in (200, 224):
         return []
     fam = model_family(board_name)
     if fam is None or fam.code != "8051":
         return []
-    return [ValidationIssue(
+    return [_make_issue(
         severity="warning",
-        sregs=(2,),
+        names=("AIR_SPEED",),
+        name_to_sreg=name_to_sreg,
         title=f"AIR_SPEED {s2} not in original SiK rate table",
         detail="The 8051 SiK firmware on this board may not support this "
                "air rate. Use 64 or 250 instead.",
     )]
 
 
-def _rule_8(s_params: dict[int, int],
-            region: Region | None) -> list[ValidationIssue]:
+def _rule_8(
+    by_name: dict[str, int],
+    name_to_sreg: dict[str, int],
+    region: Region | None,
+) -> list[ValidationIssue]:
     """R8 — frequency range matches no known regulatory region."""
-    s8 = s_params.get(8, 0)
-    s9 = s_params.get(9, 0)
+    s8 = by_name.get("MIN_FREQ", 0)
+    s9 = by_name.get("MAX_FREQ", 0)
     if s8 <= 0 or s9 <= 0:
         return []
     if region is not None:
         return []
-    return [ValidationIssue(
+    return [_make_issue(
         severity="warning",
-        sregs=(8, 9),
+        names=("MIN_FREQ", "MAX_FREQ"),
+        name_to_sreg=name_to_sreg,
         title="Frequency range doesn't match any known region",
         detail="Verify legality with your local spectrum regulator before "
                "transmitting.",
     )]
 
 
-def _rule_9(s_params: dict[int, int],
-            region: Region | None) -> list[ValidationIssue]:
+def _rule_9(
+    by_name: dict[str, int],
+    name_to_sreg: dict[str, int],
+    region: Region | None,
+) -> list[ValidationIssue]:
     """R9 — NUM_CHANNELS below regional FHSS minimum."""
     if region is None or region.min_channels is None:
         return []
-    if 10 not in s_params:
+    if "NUM_CHANNELS" not in by_name:
         return []
-    s10 = s_params[10]
+    s10 = by_name["NUM_CHANNELS"]
     if s10 >= region.min_channels:
         return []
-    return [ValidationIssue(
+    return [_make_issue(
         severity="warning",
-        sregs=(10,),
+        names=("NUM_CHANNELS",),
+        name_to_sreg=name_to_sreg,
         title=(
             f"NUM_CHANNELS={s10} below {region.code} minimum "
             f"({region.min_channels})"
@@ -259,19 +327,23 @@ def _rule_9(s_params: dict[int, int],
     )]
 
 
-def _rule_10(s_params: dict[int, int],
-             region: Region | None) -> list[ValidationIssue]:
+def _rule_10(
+    by_name: dict[str, int],
+    name_to_sreg: dict[str, int],
+    region: Region | None,
+) -> list[ValidationIssue]:
     """R10 — TX power above the regulatory limit for the matched region."""
     if region is None or region.max_tx_dbm is None:
         return []
-    if 4 not in s_params:
+    if "TXPOWER" not in by_name:
         return []
-    s4 = s_params[4]
+    s4 = by_name["TXPOWER"]
     if s4 <= region.max_tx_dbm:
         return []
-    return [ValidationIssue(
+    return [_make_issue(
         severity="error",
-        sregs=(4,),
+        names=("TXPOWER",),
+        name_to_sreg=name_to_sreg,
         title=(
             f"TXPOWER {s4} dBm exceeds {region.code} regulatory limit "
             f"({region.max_tx_dbm} dBm)"
@@ -282,19 +354,23 @@ def _rule_10(s_params: dict[int, int],
     )]
 
 
-def _rule_11(s_params: dict[int, int],
-             region: Region | None) -> list[ValidationIssue]:
+def _rule_11(
+    by_name: dict[str, int],
+    name_to_sreg: dict[str, int],
+    region: Region | None,
+) -> list[ValidationIssue]:
     """R11 — DUTY_CYCLE doesn't match the matched region."""
     if region is None or region.duty_cycle is None:
         return []
-    if 11 not in s_params:
+    if "DUTY_CYCLE" not in by_name:
         return []
-    s11 = s_params[11]
+    s11 = by_name["DUTY_CYCLE"]
     if s11 == region.duty_cycle:
         return []
-    return [ValidationIssue(
+    return [_make_issue(
         severity="warning",
-        sregs=(11,),
+        names=("DUTY_CYCLE",),
+        name_to_sreg=name_to_sreg,
         title=(
             f"DUTY_CYCLE={s11} doesn't match {region.code} "
             f"({region.duty_cycle}%)"
@@ -308,39 +384,47 @@ def _rule_11(s_params: dict[int, int],
     )]
 
 
-def _rule_12(s_params: dict[int, int],
-             region: Region | None) -> list[ValidationIssue]:
+def _rule_12(
+    by_name: dict[str, int],
+    name_to_sreg: dict[str, int],
+    region: Region | None,
+) -> list[ValidationIssue]:
     """R12 — LBT_RSSI below the matched region's minimum."""
     if region is None or region.lbt_rssi_min is None:
         return []
-    if 12 not in s_params:
+    if "LBT_RSSI" not in by_name:
         return []
-    s12 = s_params[12]
+    s12 = by_name["LBT_RSSI"]
     if s12 >= region.lbt_rssi_min:
         return []
-    return [ValidationIssue(
+    return [_make_issue(
         severity="warning",
-        sregs=(12,),
+        names=("LBT_RSSI",),
+        name_to_sreg=name_to_sreg,
         title=(
             f"LBT_RSSI={s12} below {region.code} minimum "
             f"({region.lbt_rssi_min})"
         ),
         detail=(
-            f"{region.citation} requires Listen-Before-Talk; S12 must "
-            f"be ≥{region.lbt_rssi_min}."
+            f"{region.citation} requires Listen-Before-Talk; LBT_RSSI "
+            f"must be ≥{region.lbt_rssi_min}."
         ),
         suggested_value=region.lbt_rssi_min,
         citation=region.citation,
     )]
 
 
-def _rule_13(s_params: dict[int, int]) -> list[ValidationIssue]:
+def _rule_13(
+    by_name: dict[str, int],
+    name_to_sreg: dict[str, int],
+) -> list[ValidationIssue]:
     """R13 — Golay ECC enabled (no longer recommended)."""
-    if s_params.get(5) != 1:
+    if by_name.get("ECC") != 1:
         return []
-    return [ValidationIssue(
+    return [_make_issue(
         severity="warning",
-        sregs=(5,),
+        names=("ECC",),
+        name_to_sreg=name_to_sreg,
         title="ECC enabled (no longer recommended)",
         detail="ArduPilot wiki: 'Using error correction is no longer "
                "recommended due to the range reduction and the fact that "
@@ -349,80 +433,101 @@ def _rule_13(s_params: dict[int, int]) -> list[ValidationIssue]:
     )]
 
 
-def _rule_14(s_params: dict[int, int]) -> list[ValidationIssue]:
+def _rule_14(
+    by_name: dict[str, int],
+    name_to_sreg: dict[str, int],
+) -> list[ValidationIssue]:
     """R14 — MAVLink framing disabled at a telemetry-class rate."""
-    if 6 not in s_params or 2 not in s_params:
+    if "MAVLINK" not in by_name or "AIR_SPEED" not in by_name:
         return []
-    if s_params[6] != 0:
+    if by_name["MAVLINK"] != 0:
         return []
-    if s_params[2] not in _TELEMETRY_AIR_RATES:
+    if by_name["AIR_SPEED"] not in _TELEMETRY_AIR_RATES:
         return []
-    return [ValidationIssue(
+    return [_make_issue(
         severity="info",
-        sregs=(6,),
+        names=("MAVLINK",),
+        name_to_sreg=name_to_sreg,
         title="MAVLink framing disabled",
-        detail="At telemetry-class air rates, S6=2 (low-latency MAVLink) "
+        detail="At telemetry-class air rates, MAVLINK=2 (low-latency) "
                "prevents packet fragmentation and prioritises RC_OVERRIDE. "
-               "Set S6=0 only if you're bridging non-MAVLink serial.",
+               "Set MAVLINK=0 only if you're bridging non-MAVLink serial.",
     )]
 
 
-def _rule_15(s_params: dict[int, int]) -> list[ValidationIssue]:
+def _rule_15(
+    by_name: dict[str, int],
+    name_to_sreg: dict[str, int],
+) -> list[ValidationIssue]:
     """R15 — MAVLink framing on a slow link saturates easily."""
-    if 6 not in s_params or 2 not in s_params:
+    if "MAVLINK" not in by_name or "AIR_SPEED" not in by_name:
         return []
-    s6 = s_params[6]
-    s2 = s_params[2]
+    s6 = by_name["MAVLINK"]
+    s2 = by_name["AIR_SPEED"]
     if s6 < 1 or not (0 < s2 < 16):
         return []
-    return [ValidationIssue(
+    return [_make_issue(
         severity="warning",
-        sregs=(2, 6),
+        names=("AIR_SPEED", "MAVLINK"),
+        name_to_sreg=name_to_sreg,
         title="MAVLink framing on a slow link",
         detail="Air rates below 16 kbps are easily saturated by full-rate "
                "MAVLink. Reduce telemetry rates or raise AIR_SPEED.",
     )]
 
 
-def _rule_16(s_params: dict[int, int]) -> list[ValidationIssue]:
+def _rule_16(
+    by_name: dict[str, int],
+    name_to_sreg: dict[str, int],
+) -> list[ValidationIssue]:
     """R16 — small MAX_WINDOW combined with low AIR_SPEED starves throughput."""
-    if 15 not in s_params or 2 not in s_params:
+    if "MAX_WINDOW" not in by_name or "AIR_SPEED" not in by_name:
         return []
-    s15 = s_params[15]
-    s2 = s_params[2]
+    s15 = by_name["MAX_WINDOW"]
+    s2 = by_name["AIR_SPEED"]
     if s15 >= 50 or not (0 < s2 < 64):
         return []
-    return [ValidationIssue(
+    return [_make_issue(
         severity="warning",
-        sregs=(2, 15),
+        names=("AIR_SPEED", "MAX_WINDOW"),
+        name_to_sreg=name_to_sreg,
         title="Low MAX_WINDOW + low AIR_SPEED starves throughput",
         detail="Small windows minimise latency but require sufficient "
-               "air-rate headroom. Either raise S2 to ≥64 or raise S15.",
+               "air-rate headroom. Either raise AIR_SPEED to ≥64 or "
+               "raise MAX_WINDOW.",
     )]
 
 
-def _rule_17(s_params: dict[int, int]) -> list[ValidationIssue]:
+def _rule_17(
+    by_name: dict[str, int],
+    name_to_sreg: dict[str, int],
+) -> list[ValidationIssue]:
     """R17 — RTS/CTS rarely useful below 64 kbps air rate."""
-    if 14 not in s_params or 2 not in s_params:
+    if "RTSCTS" not in by_name or "AIR_SPEED" not in by_name:
         return []
-    if s_params[14] != 1 or not (0 < s_params[2] < 64):
+    if by_name["RTSCTS"] != 1 or not (0 < by_name["AIR_SPEED"] < 64):
         return []
-    return [ValidationIssue(
+    return [_make_issue(
         severity="info",
-        sregs=(14,),
+        names=("RTSCTS",),
+        name_to_sreg=name_to_sreg,
         title="RTS/CTS most useful at AIR_SPEED ≥ 64 kbps",
         detail="Hardware flow control protects against UART overrun mainly "
                "when the air link approaches the serial speed.",
     )]
 
 
-def _rule_18(s_params: dict[int, int]) -> list[ValidationIssue]:
+def _rule_18(
+    by_name: dict[str, int],
+    name_to_sreg: dict[str, int],
+) -> list[ValidationIssue]:
     """R18 — using factory NETID risks colliding with another nearby pair."""
-    if s_params.get(3) != 25:
+    if by_name.get("NETID") != 25:
         return []
-    return [ValidationIssue(
+    return [_make_issue(
         severity="info",
-        sregs=(3,),
+        names=("NETID",),
+        name_to_sreg=name_to_sreg,
         title="Using factory NETID (25)",
         detail="Pairs operating in proximity must each pick a unique NETID; "
                "otherwise hop sequences collide and ranges drop.",
@@ -432,6 +537,7 @@ def _rule_18(s_params: dict[int, int]) -> list[ValidationIssue]:
 def _rule_19(
     s_params: dict[int, int],
     current_values: dict[int, int],
+    sreg_to_name: dict[int, str],
     firmware_banner: str,
 ) -> list[ValidationIssue]:
     """R19 — firmware-locked register: pre-flight detection.
@@ -439,11 +545,10 @@ def _rule_19(
     Some RFDesign firmware variants (notably "-US"/"-EU" SKUs) factory-lock
     a subset of S-registers to keep the radio inside its certification
     envelope.  The radio replies "ERROR" to *any* attempted change of those
-    registers.
-
-    For each locked sreg, if the user's intended value differs from the
-    radio's current value, raise a warning so the user knows the change
-    won't survive a Save Settings.
+    registers.  This rule operates in *sreg* space because the lock is
+    enforced by the firmware on the wire — but the issue title surfaces
+    the firmware's reported parameter NAME so the user sees what the
+    register actually represents on their radio.
     """
     locked = regions.firmware_lockdown(firmware_banner)
     if not locked:
@@ -457,10 +562,13 @@ def _rule_19(
         actual = current_values[sreg]
         if intended == actual:
             continue
+        name = sreg_to_name.get(sreg, "")
+        display = f"S{sreg} {name}".strip() or f"S{sreg}"
         out.append(ValidationIssue(
             severity="warning",
             sregs=(sreg,),
-            title=f"S{sreg} is firmware-locked on {label}",
+            param_names=(name,) if name else (),
+            title=f"{display} is firmware-locked on {label}",
             detail=(
                 f"Your intended value ({intended}) differs from the radio's "
                 f"current value ({actual}). RFDesign locks frequency-hopping "
@@ -468,7 +576,7 @@ def _rule_19(
                 f"the radio inside its FCC/ETSI/ACMA test envelope. Save will "
                 f"fail for this register; revert to {actual} or leave it as-is."
             ),
-            fix_hint=f"Revert S{sreg} to the radio's locked value ({actual}).",
+            fix_hint=f"Revert to the radio's locked value ({actual}).",
             suggested_value=actual,
         ))
     return out
@@ -479,6 +587,7 @@ def _rule_19(
 def validate_config(
     s_params: dict[int, int],
     *,
+    sreg_to_name: dict[int, str] | None = None,
     board_name: str = "",
     pin_params: dict[int, int] | None = None,
     is_remote: bool = False,
@@ -487,44 +596,57 @@ def validate_config(
 ) -> ValidationReport:
     """Run every rule in canonical order and return a :class:`ValidationReport`.
 
-    ``firmware_banner`` and ``current_values`` are optional inputs needed by
-    R19 (firmware-lockdown detection).  Pass the radio's ATI banner string
-    and the most recent values read off the radio (typically from the last
-    ``params_loaded`` event).  Without them R19 is silently skipped.
+    ``s_params`` and ``current_values`` are sreg-keyed (matching what the
+    UI tracks).  ``sreg_to_name`` tells us which sreg holds which parameter
+    on this firmware — typically the ``s_names`` field of the radio's
+    ``ATI5`` response.  When omitted the canonical SiK mapping is used,
+    which matches the original firmware but not RFDesign's SiK 3.x.
 
-    Set ``is_remote=True`` when validating the *remote* radio's panel: the
-    partner's exact board model isn't reliably known, so model-specific
-    rules (R4, R5, R7) are skipped.  R19 is also skipped on the remote.
+    ``firmware_banner`` and ``current_values`` are inputs to R19
+    (firmware-lockdown detection); without them R19 is silently skipped.
+
+    Set ``is_remote=True`` when validating the *remote* radio's panel —
+    model-specific rules (R4, R5, R7, R19) are skipped because the partner
+    radio's firmware variant isn't reliably known.
     """
-    # Deliberately do not mutate caller's dicts.
-    s_params = dict(s_params)
-    current_values = dict(current_values or {})
+    if sreg_to_name is None:
+        sreg_to_name = registers.CANONICAL_SIK_NAMES
+    name_to_sreg: dict[str, int] = {n: s for s, n in sreg_to_name.items()}
+
+    # Project sreg-keyed inputs onto the name-keyed view rules use.
+    by_name: dict[str, int] = {}
+    for sreg, value in s_params.items():
+        name = sreg_to_name.get(sreg)
+        if name:
+            by_name[name] = value
 
     region: Region | None = None
-    if 8 in s_params and 9 in s_params:
-        region = detect_region(s_params[8], s_params[9])
+    if "MIN_FREQ" in by_name and "MAX_FREQ" in by_name:
+        region = detect_region(by_name["MIN_FREQ"], by_name["MAX_FREQ"])
 
     issues: list[ValidationIssue] = []
-    issues.extend(_rule_1(s_params))
-    issues.extend(_rule_2(s_params))
-    issues.extend(_rule_3(s_params))
+    issues.extend(_rule_1(by_name, name_to_sreg))
+    issues.extend(_rule_2(by_name, name_to_sreg))
+    issues.extend(_rule_3(by_name, name_to_sreg))
     if not is_remote:
-        issues.extend(_rule_4(s_params, board_name))
-        issues.extend(_rule_5(s_params))
-        issues.extend(_rule_7(s_params, board_name))
-    issues.extend(_rule_8(s_params, region))
-    issues.extend(_rule_9(s_params, region))
-    issues.extend(_rule_10(s_params, region))
-    issues.extend(_rule_11(s_params, region))
-    issues.extend(_rule_12(s_params, region))
-    issues.extend(_rule_13(s_params))
-    issues.extend(_rule_14(s_params))
-    issues.extend(_rule_15(s_params))
-    issues.extend(_rule_16(s_params))
-    issues.extend(_rule_17(s_params))
-    issues.extend(_rule_18(s_params))
-    if not is_remote:
-        issues.extend(_rule_19(s_params, current_values, firmware_banner))
+        issues.extend(_rule_4(by_name, name_to_sreg, board_name))
+        issues.extend(_rule_5(by_name, name_to_sreg))
+        issues.extend(_rule_7(by_name, name_to_sreg, board_name))
+    issues.extend(_rule_8(by_name, name_to_sreg, region))
+    issues.extend(_rule_9(by_name, name_to_sreg, region))
+    issues.extend(_rule_10(by_name, name_to_sreg, region))
+    issues.extend(_rule_11(by_name, name_to_sreg, region))
+    issues.extend(_rule_12(by_name, name_to_sreg, region))
+    issues.extend(_rule_13(by_name, name_to_sreg))
+    issues.extend(_rule_14(by_name, name_to_sreg))
+    issues.extend(_rule_15(by_name, name_to_sreg))
+    issues.extend(_rule_16(by_name, name_to_sreg))
+    issues.extend(_rule_17(by_name, name_to_sreg))
+    issues.extend(_rule_18(by_name, name_to_sreg))
+    if not is_remote and current_values:
+        issues.extend(_rule_19(
+            dict(s_params), dict(current_values), sreg_to_name, firmware_banner,
+        ))
 
     return ValidationReport(
         issues=tuple(issues),

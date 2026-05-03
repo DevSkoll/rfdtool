@@ -50,12 +50,16 @@ from rfd.presets import (
 )
 from rfd.radio import Radio
 from rfd.registers import (
+    CANONICAL_PIN_NAMES,
+    CANONICAL_SIK_NAMES,
     PIN_REGISTERS,
     REGISTERS,
     RegisterDef,
     all_pin_registers,
     all_registers,
+    derive_def,
     validate,
+    validate_value,
 )
 from rfd.validation import ValidationReport, validate_config
 
@@ -213,6 +217,17 @@ class _RegisterPanel(QWidget):
         self._is_remote = is_remote
         self._rows: dict[tuple[int, bool], _Row] = {}
         self._dirty: set[tuple[int, bool]] = set()
+        # Per-panel mapping learned from the radio's ATI5 response.
+        # Defaults to the canonical SiK layout so a disconnected panel
+        # still renders something useful.
+        self._sreg_to_name: dict[int, str] = dict(CANONICAL_SIK_NAMES)
+        self._pin_sreg_to_name: dict[int, str] = dict(CANONICAL_PIN_NAMES)
+        self._name_to_sreg: dict[str, int] = {
+            n: s for s, n in self._sreg_to_name.items()
+        }
+        self._pin_name_to_sreg: dict[str, int] = {
+            n: s for s, n in self._pin_sreg_to_name.items()
+        }
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(4, 4, 4, 4)
@@ -231,6 +246,10 @@ class _RegisterPanel(QWidget):
         body_layout = QVBoxLayout(body)
         body_layout.setContentsMargins(4, 4, 4, 4)
         body_layout.setSpacing(2)
+        # Stash the layouts so we can clear+rebuild rows when the radio
+        # reports a different parameter layout than canonical SiK.
+        self._body = body
+        self._body_layout = body_layout
 
         # ---- S-register rows -----------------------------------------
         for reg in all_registers():
@@ -246,6 +265,8 @@ class _RegisterPanel(QWidget):
         pin_layout = QVBoxLayout(pin_inner)
         pin_layout.setContentsMargins(4, 4, 4, 4)
         pin_layout.setSpacing(2)
+        self._pin_inner = pin_inner
+        self._pin_layout = pin_layout
         for reg in all_pin_registers():
             row_widget, row = self._build_row(reg, is_pin=True, parent=pin_inner)
             pin_layout.addWidget(row_widget)
@@ -336,9 +357,35 @@ class _RegisterPanel(QWidget):
         self,
         s_params: dict[int, int],
         pin_params: dict[int, int] | None = None,
+        *,
+        s_names: dict[int, str] | None = None,
+        pin_names: dict[int, str] | None = None,
     ) -> None:
+        """Update row values from a fresh ATI5 read.
+
+        If ``s_names`` / ``pin_names`` are supplied (typically from
+        ``Ati5Result``), the panel rebuilds its rows to match the firmware's
+        actual parameter layout — making sure RFDesign 3.x users see
+        ``S14: MAX_WINDOW`` instead of the canonical ``S14: RTSCTS``
+        labelling.  Existing values are preserved across the rebuild.
+        """
+        if s_names is not None and s_names != self._sreg_to_name:
+            self._rebuild_layout(
+                s_names=s_names,
+                pin_names=pin_names if pin_names is not None else self._pin_sreg_to_name,
+            )
+        elif pin_names is not None and pin_names != self._pin_sreg_to_name:
+            self._rebuild_layout(
+                s_names=self._sreg_to_name,
+                pin_names=pin_names,
+            )
+
         for sreg, value in s_params.items():
             row = self._rows.get((sreg, False))
+            if row is None and sreg in self._sreg_to_name:
+                # Layout already rebuilt above but row missing somehow —
+                # add it on the fly. Edge case; shouldn't normally hit.
+                continue
             if row is not None:
                 row.set_value(value)
                 self._mark_clean(sreg, False)
@@ -348,6 +395,82 @@ class _RegisterPanel(QWidget):
                 if row is not None:
                     row.set_value(value)
                     self._mark_clean(sreg, True)
+
+    # ---------------------------------------------------------------- layout
+    def _rebuild_layout(
+        self,
+        *,
+        s_names: dict[int, str],
+        pin_names: dict[int, str],
+    ) -> None:
+        """Replace the S/R row widgets with ones reflecting `s_names` /
+        `pin_names`.  Preserves dirty state where the sreg still exists in
+        the new layout.
+        """
+        # Remember which sregs were dirty AND their current values, so we
+        # can carry them across the rebuild.
+        dirty_snapshot: dict[tuple[int, bool], int] = {}
+        for key in list(self._dirty):
+            row = self._rows.get(key)
+            if row is not None:
+                dirty_snapshot[key] = row.value()
+
+        self._clear_layout(self._body_layout)
+        self._clear_layout(self._pin_layout)
+        self._rows.clear()
+        self._dirty.clear()
+
+        self._sreg_to_name = dict(s_names)
+        self._name_to_sreg = {n: s for s, n in self._sreg_to_name.items()}
+        self._pin_sreg_to_name = dict(pin_names)
+        self._pin_name_to_sreg = {n: s for s, n in self._pin_sreg_to_name.items()}
+
+        for sreg in sorted(self._sreg_to_name.keys()):
+            name = self._sreg_to_name[sreg]
+            reg = derive_def(sreg, name)
+            row_widget, row = self._build_row(reg, is_pin=False, parent=self._body)
+            self._body_layout.addWidget(row_widget)
+            self._rows[(sreg, False)] = row
+
+        for sreg in sorted(self._pin_sreg_to_name.keys()):
+            name = self._pin_sreg_to_name[sreg]
+            reg = derive_def(sreg, name)
+            # Pin labels stay R-prefixed regardless of catalog label.
+            reg = RegisterDef(
+                sreg=reg.sreg, name=reg.name,
+                label=f"Pin R{sreg} {name}" if name != "PIN_FUNC" else f"Pin R{sreg} function",
+                tooltip=reg.tooltip, kind=reg.kind,
+                minimum=reg.minimum, maximum=reg.maximum, enum=reg.enum,
+                default=reg.default, units=reg.units,
+                variant_notes=reg.variant_notes, read_only=reg.read_only,
+            )
+            row_widget, row = self._build_row(reg, is_pin=True, parent=self._pin_inner)
+            self._pin_layout.addWidget(row_widget)
+            self._rows[(sreg, True)] = row
+
+        # Restore previously-dirty values where the sreg still exists.
+        for (sreg, is_pin), value in dirty_snapshot.items():
+            row = self._rows.get((sreg, is_pin))
+            if row is not None:
+                row.set_value(value)
+                self._mark_dirty(sreg, is_pin)
+
+    @staticmethod
+    def _clear_layout(layout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
+            if item is None:
+                continue
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+
+    def sreg_to_name(self) -> dict[int, str]:
+        return dict(self._sreg_to_name)
+
+    def name_to_sreg(self) -> dict[str, int]:
+        return dict(self._name_to_sreg)
 
     def mark_all_clean(self) -> None:
         for key in list(self._dirty):
@@ -821,7 +944,9 @@ class SettingsTab(QWidget):
     def _apply_profile(self, profile: Profile) -> None:
         """Show the confirm-and-diff dialog, then stage values on the local panel."""
         current_values: dict[int, int] = {}
-        for sreg in REGISTERS.keys():
+        for (sreg, is_pin) in self._local_panel.rows():
+            if is_pin:
+                continue
             v = self._local_panel.get_value(sreg, is_pin=False)
             if v is not None:
                 current_values[sreg] = int(v)
@@ -829,6 +954,8 @@ class SettingsTab(QWidget):
             profile,
             current_values,
             board_name=self._board_name,
+            name_to_sreg=self._local_panel.name_to_sreg(),
+            sreg_to_name=self._local_panel.sreg_to_name(),
             parent=self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -836,22 +963,38 @@ class SettingsTab(QWidget):
         self._apply_profile_force(profile)
 
     def _apply_profile_force(self, profile: Profile) -> None:
+        # Translate the preset's name-keyed params via the panel's actual
+        # firmware mapping. Names absent on this radio (e.g. MANCHESTER on
+        # RFDesign 3.x) are silently skipped — the underlying parameter
+        # doesn't exist on the connected hardware.
+        name_to_sreg = self._local_panel.name_to_sreg()
+        target_sregs = profile.to_sregs_for(name_to_sreg)
         applied = 0
-        for sreg, value in profile.s_registers.items():
-            reg = REGISTERS.get(int(sreg))
-            if reg is None or reg.read_only:
+        skipped_names = []
+        for n in sorted(profile.params):
+            if n not in name_to_sreg:
+                skipped_names.append(n)
+        for sreg, value in target_sregs.items():
+            row = self._local_panel.rows().get((int(sreg), False))
+            if row is None or row.reg.read_only:
                 continue
             self._local_panel.set_value(int(sreg), int(value), is_pin=False)
             applied += 1
         for sreg, value in profile.pin_registers.items():
-            if int(sreg) in PIN_REGISTERS:
+            row = self._local_panel.rows().get((int(sreg), True))
+            if row is not None:
                 self._local_panel.set_value(int(sreg), int(value), is_pin=True)
                 applied += 1
-        self._emit_status(
+        msg = (
             f"Applied preset '{profile.name}' to local panel "
-            f"({applied} registers, unsaved). Click Save Settings to commit.",
-            6000,
+            f"({applied} registers, unsaved). Click Save Settings to commit."
         )
+        if skipped_names:
+            msg += (
+                f"  Skipped {len(skipped_names)} parameter(s) not present on "
+                f"this radio: {', '.join(skipped_names)}."
+            )
+        self._emit_status(msg, 8000)
 
     # ---------------------------------------------------------------- validation
     def _on_validate_clicked(self) -> None:
@@ -868,6 +1011,7 @@ class SettingsTab(QWidget):
 
         report = validate_config(
             s_params,
+            sreg_to_name=self._local_panel.sreg_to_name(),
             pin_params=pin_params,
             board_name=self._board_name,
             is_remote=False,
@@ -1046,9 +1190,18 @@ class SettingsTab(QWidget):
     def _on_params_loaded(self, result: object, is_remote: bool) -> None:
         s_params: dict[int, int] = getattr(result, "s_params", {}) or {}
         pin_params: dict[int, int] = getattr(result, "pin_params", {}) or {}
+        # New in v3 of Ati5Result: the firmware's reported parameter names
+        # so the panel can render correct labels per radio variant.
+        s_names: dict[int, str] = getattr(result, "s_names", {}) or {}
+        pin_names: dict[int, str] = getattr(result, "pin_names", {}) or {}
 
         panel = self._remote_panel if is_remote else self._local_panel
-        panel.apply_values(s_params, pin_params)
+        panel.apply_values(
+            s_params,
+            pin_params,
+            s_names=s_names if s_names else None,
+            pin_names=pin_names if pin_names else None,
+        )
         panel.mark_all_clean()
 
         # Cache the LOCAL snapshot so the validator's R19 (firmware lockdown

@@ -1,20 +1,28 @@
-"""SiK firmware S-register and pin-mapping (R-register) definitions.
+"""Parameter catalog for SiK-family radio firmware.
 
-The SiK firmware family (used by the RFDesign RFD900x/900ux/900+ and similar
-HopeRF/HM-TRP modems) exposes its persistent configuration as numbered
-"S-registers" (S0..S15) plus, on RFD900x/ux, a set of pin-mapping registers
-(R0..R15). The radio reads/writes them with ``ATSn?`` and ``ATSn=value``
-commands; values survive a reboot once committed with ``AT&W``.
+Two indexable views of every parameter rfdtool understands:
 
-This module is pure data plus a tiny validator. It deliberately performs no
-serial I/O and imports nothing outside the standard library so it is safe to
-import from both the protocol layer and the Qt UI without side effects.
+* :data:`CATALOG` — keyed by **parameter name** (e.g. ``"MAX_WINDOW"``).  The
+  authoritative table of constraints, friendly labels, and tooltips.  This
+  is what callers should consult when they know the parameter by name —
+  e.g. when applying a preset, validating a value, or rendering a row in
+  the settings tab built from the radio's own ``ATI5`` output.
 
-For the canonical register semantics see the SiK firmware source:
-    https://github.com/RFDesign/SiK
-specifically ``Firmware/radio/parameters.h`` and ``Firmware/radio/parameters.c``.
-The RFD900x extensions (pin-mapping, additional air rates) are documented in
-the RFD900x manual published by RFDesign.
+* :data:`REGISTERS` — keyed by **canonical S-register number** (S0..S15 plus
+  generic S16..S29 advanced rows).  Derived from CATALOG using the
+  canonical SiK firmware mapping (see :data:`CANONICAL_SIK_NAMES`).  Kept
+  for backwards compatibility with code that still hardcodes sreg numbers.
+
+The split exists because RFDesign's SiK 3.x firmware reorders the registers
+relative to the original ArduPilot/SiK enum: their S13/S14/S15 are
+``RTSCTS``/``MAX_WINDOW``/``ENCRYPTION_LEVEL`` rather than canonical
+``MANCHESTER``/``RTSCTS``/``MAX_WINDOW``.  Code that operates by name keeps
+working across firmware variants; code that operates by sreg number is
+correct only for the variant whose mapping it assumes.
+
+For the canonical SiK semantics see ``Firmware/radio/parameters.h`` in
+https://github.com/ArduPilot/SiK . For the RFDesign 3.x extensions, the
+authoritative source is each radio's own ``ATI5`` response.
 """
 from __future__ import annotations
 
@@ -22,7 +30,34 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
+class ParamSpec:
+    """A single parameter's semantic specification — no sreg number.
+
+    Matches one entry in :data:`CATALOG`.  When combined with an sreg
+    number (typically learned from ``ATI5``) you get a :class:`RegisterDef`
+    via :func:`derive_def`.
+    """
+    name: str
+    label: str
+    tooltip: str
+    kind: str                       # "int" | "enum" | "bool"
+    minimum: int | None
+    maximum: int | None
+    enum: dict[int, str] | None
+    default: int | None
+    units: str | None
+    variant_notes: str = ""
+    read_only: bool = False
+
+
+@dataclass(frozen=True)
 class RegisterDef:
+    """A parameter pinned to a specific sreg number on a specific firmware.
+
+    Built dynamically by :func:`derive_def` from the catalog spec for that
+    name plus the sreg number reported by the firmware.  Kept as a separate
+    type for backwards compatibility with the original sreg-keyed API.
+    """
     sreg: int
     name: str
     label: str
@@ -37,300 +72,28 @@ class RegisterDef:
     read_only: bool = False
 
 
-# SiK accepts a shorthand for serial baud rates: the integer is the rate in
-# kbps truncated (e.g. 57 -> 57600). Keep the mapping aligned with what the
-# firmware's parameter table accepts so the UI's combo entries round-trip.
+# --------------------------------------------------------------------- enums
 _SERIAL_SPEED_ENUM: dict[int, str] = {
-    1: "1200",
-    2: "2400",
-    4: "4800",
-    9: "9600",
-    19: "19200",
-    38: "38400",
-    57: "57600",
-    115: "115200",
+    1: "1200",  2: "2400",  4: "4800",  9: "9600",
+    19: "19200", 38: "38400", 57: "57600", 115: "115200",
     230: "230400",
 }
 
-# S2 AIR_SPEED is encoded as the SUPERSET of values supported across the
-# RFD900/900+ and RFD900x/ux variants. The classic RFD900/900+ supports rates
-# up to 250 kbps; the RFD900x firmware exposes a different curated subset
-# (12/56/64/100/125/200/250). The UI must be able to display whatever is read
-# from the radio regardless of which firmware generated it; per-variant
-# legality is enforced at runtime by the layer that knows which radio is
-# attached, not by this validator.
+
 _AIR_SPEED_VALUES: tuple[int, ...] = (
-    2, 4, 8, 16, 19, 24, 32, 48, 64, 96, 128, 192, 200, 224, 250,
+    2, 4, 8, 16, 19, 24, 32, 48, 64, 96, 100, 125, 128, 192, 200, 224, 250,
 )
 _AIR_SPEED_ENUM: dict[int, str] = {v: f"{v} kbps" for v in _AIR_SPEED_VALUES}
 
 
-REGISTERS: dict[int, RegisterDef] = {
-    0: RegisterDef(
-        sreg=0,
-        name="FORMAT",
-        label="Parameter format",
-        tooltip="Parameter format version reported by the firmware. "
-                "Read-only; written by the radio itself.",
-        kind="int",
-        minimum=None,
-        maximum=None,
-        enum=None,
-        default=None,
-        units=None,
-        read_only=True,
-    ),
-    1: RegisterDef(
-        sreg=1,
-        name="SERIAL_SPEED",
-        label="Serial baud rate",
-        tooltip="Baud rate of the host UART, expressed as the SiK shorthand "
-                "(e.g. 57 = 57600 baud). Both ends of the link must agree "
-                "with the host that talks to them; the over-the-air rate is "
-                "set separately by AIR_SPEED.",
-        kind="enum",
-        minimum=None,
-        maximum=None,
-        enum=dict(_SERIAL_SPEED_ENUM),
-        default=57,
-        units="kbps",
-    ),
-    2: RegisterDef(
-        sreg=2,
-        name="AIR_SPEED",
-        label="Air data rate",
-        tooltip="Over-the-air data rate in kbps. Lower rates trade throughput "
-                "for range and link margin. Both ends of the link must use "
-                "the same value.",
-        kind="enum",
-        minimum=None,
-        maximum=None,
-        enum=dict(_AIR_SPEED_ENUM),
-        default=64,
-        units="kbps",
-        variant_notes=(
-            "RFD900/900+ supports rates up to 250 kbps from the full table. "
-            "RFD900x exposes a curated subset (typically 12/56/64/100/125/"
-            "200/250). This module encodes the superset so the UI can render "
-            "any value read from the radio; per-variant legality is enforced "
-            "elsewhere."
-        ),
-    ),
-    3: RegisterDef(
-        sreg=3,
-        name="NETID",
-        label="Network ID",
-        tooltip="Network identifier. Both ends of a link must share the same "
-                "NETID; radios on different NETIDs ignore each other.",
-        kind="int",
-        minimum=0,
-        maximum=499,
-        enum=None,
-        default=25,
-        units=None,
-    ),
-    4: RegisterDef(
-        sreg=4,
-        name="TXPOWER",
-        label="Transmit power",
-        tooltip="Transmit power in dBm. Higher values increase range at the "
-                "cost of current draw and regulatory headroom.",
-        kind="int",
-        minimum=0,
-        maximum=30,
-        enum=None,
-        default=20,
-        units="dBm",
-        variant_notes="RFD900x can output up to 30 dBm (1 W); some variants cap lower.",
-    ),
-    5: RegisterDef(
-        sreg=5,
-        name="ECC",
-        label="Error correction (Golay)",
-        tooltip="Enables Golay forward error correction. Halves usable "
-                "throughput but greatly improves reliability on marginal links.",
-        kind="bool",
-        minimum=None,
-        maximum=None,
-        enum={0: "Off", 1: "On"},
-        default=0,
-        units=None,
-    ),
-    6: RegisterDef(
-        sreg=6,
-        name="MAVLINK",
-        label="MAVLink framing",
-        tooltip="Selects how the radio frames the serial stream. MAVLink "
-                "framing aligns radio packets to MAVLink message boundaries; "
-                "low-latency MAVLink shortens TDM slots for latency-sensitive "
-                "links.",
-        kind="enum",
-        minimum=None,
-        maximum=None,
-        enum={0: "Raw data", 1: "MAVLink framing", 2: "Low-latency MAVLink"},
-        default=1,
-        units=None,
-    ),
-    7: RegisterDef(
-        sreg=7,
-        name="OPPRESEND",
-        label="Opportunistic resend",
-        tooltip="When enabled, the radio uses otherwise-idle TDM slots to "
-                "opportunistically resend recent packets, improving delivery "
-                "on lossy links at the cost of some throughput.",
-        kind="enum",
-        minimum=None,
-        maximum=None,
-        enum={0: "Off", 1: "On"},
-        default=0,
-        units=None,
-    ),
-    8: RegisterDef(
-        sreg=8,
-        name="MIN_FREQ",
-        label="Minimum frequency",
-        tooltip="Lower bound of the frequency-hopping range, in kHz. Must lie "
-                "within the band the radio's hardware supports.",
-        kind="int",
-        minimum=414000,
-        maximum=976000,
-        enum=None,
-        default=None,
-        units="kHz",
-    ),
-    9: RegisterDef(
-        sreg=9,
-        name="MAX_FREQ",
-        label="Maximum frequency",
-        tooltip="Upper bound of the frequency-hopping range, in kHz. MAX_FREQ "
-                "must be greater than MIN_FREQ; that cross-field check is the "
-                "UI's job, not this validator.",
-        kind="int",
-        minimum=414000,
-        maximum=976000,
-        enum=None,
-        default=None,
-        units="kHz",
-    ),
-    10: RegisterDef(
-        sreg=10,
-        name="NUM_CHANNELS",
-        label="Number of hopping channels",
-        tooltip="Number of frequency-hopping channels spread across "
-                "MIN_FREQ..MAX_FREQ. More channels improve coexistence with "
-                "other users of the band. The original SiK firmware capped "
-                "this at 50; RFDesign's newer firmwares (especially -US/-EU "
-                "SKUs that lock at 51) accept higher values up to the uint8 "
-                "hardware ceiling.",
-        kind="int",
-        minimum=1,
-        maximum=255,
-        enum=None,
-        default=20,
-        units=None,
-        variant_notes="Range widened to 1..255; the per-region regulatory "
-                      "minimum is enforced separately by the validator (R9).",
-    ),
-    11: RegisterDef(
-        sreg=11,
-        name="DUTY_CYCLE",
-        label="Transmit duty cycle",
-        tooltip="Maximum percentage of time the radio is permitted to "
-                "transmit. Lower this to comply with regional duty-cycle "
-                "regulations.",
-        kind="int",
-        minimum=10,
-        maximum=100,
-        enum=None,
-        default=100,
-        units="%",
-    ),
-    12: RegisterDef(
-        sreg=12,
-        name="LBT_RSSI",
-        label="Listen-before-talk RSSI",
-        tooltip="0 disables Listen-Before-Talk. A non-zero value (typically "
-                "25..220) is the RSSI threshold above which the radio backs "
-                "off before transmitting, used to satisfy regulations that "
-                "mandate LBT.",
-        kind="int",
-        minimum=0,
-        maximum=220,
-        enum=None,
-        default=0,
-        units=None,
-    ),
-    13: RegisterDef(
-        sreg=13,
-        name="MANCHESTER",
-        label="Manchester encoding",
-        tooltip="Enables Manchester line coding on the air interface. Rarely "
-                "needed; both ends must agree.",
-        kind="enum",
-        minimum=None,
-        maximum=None,
-        enum={0: "Off", 1: "On"},
-        default=0,
-        units=None,
-    ),
-    14: RegisterDef(
-        sreg=14,
-        name="RTSCTS",
-        label="Hardware flow control",
-        tooltip="Enables RTS/CTS hardware flow control on the host UART. "
-                "Recommended at high serial speeds to prevent overruns.",
-        kind="enum",
-        minimum=None,
-        maximum=None,
-        enum={0: "Off", 1: "On"},
-        default=0,
-        units=None,
-    ),
-    15: RegisterDef(
-        sreg=15,
-        name="MAX_WINDOW",
-        label="Maximum TDM window",
-        tooltip="Maximum length of a TDM transmit window in milliseconds. "
-                "Smaller values reduce latency; larger values improve "
-                "throughput on long links. Newer SiK builds (3.x on the "
-                "RFD900x/X2) report 0 here when the parameter is unused.",
-        kind="int",
-        minimum=0,
-        maximum=131,
-        enum=None,
-        default=131,
-        units="ms",
-        variant_notes="Range widened to 0..131 to accommodate newer firmware "
-                      "that reports 0 for this register.",
-    ),
+_BOOL_ENUM: dict[int, str] = {0: "Off", 1: "On"}
+
+
+_MAVLINK_ENUM: dict[int, str] = {
+    0: "Raw data",
+    1: "MAVLink framing",
+    2: "Low-latency MAVLink",
 }
-
-
-# Newer SiK builds (e.g. RFD SiK 3.57 on RFD900X2-US) report S16..S29 in
-# addition to the original 16. The semantics are firmware-specific and not
-# documented in the SiK header for the older 8051 builds, so we expose them
-# as generic "advanced" int rows with permissive ranges. The UI shows them
-# in the regular S-register list; expert users edit them at their own risk.
-def _advanced(sreg: int) -> RegisterDef:
-    return RegisterDef(
-        sreg=sreg,
-        name=f"ADV_S{sreg}",
-        label=f"S{sreg} (advanced)",
-        tooltip="Advanced/firmware-specific register. Reported by newer SiK "
-                "builds; meaning depends on the radio firmware version. "
-                "Refer to the SiK source for the exact semantics.",
-        kind="int",
-        minimum=0,
-        maximum=65535,
-        enum=None,
-        default=None,
-        units=None,
-        variant_notes="Present on newer SiK builds (e.g. RFD900x2 SiK 3.x).",
-    )
-
-
-for _adv in range(16, 30):
-    REGISTERS[_adv] = _advanced(_adv)
 
 
 _PIN_FUNCTION_ENUM: dict[int, str] = {
@@ -341,78 +104,477 @@ _PIN_FUNCTION_ENUM: dict[int, str] = {
     4: "Analog input",
 }
 
-_PIN_TOOLTIP = (
-    "Selects the function of GPIO pin R{n}. Pin mapping is available on "
-    "RFD900x/ux only; other variants ignore these registers."
-)
 
-PIN_REGISTERS: dict[int, RegisterDef] = {
-    n: RegisterDef(
-        sreg=n,
-        name=f"PIN_R{n}",
-        label=f"Pin R{n} function",
-        tooltip=_PIN_TOOLTIP.format(n=n),
-        kind="enum",
-        minimum=None,
-        maximum=None,
-        enum=dict(_PIN_FUNCTION_ENUM),
-        default=0,
-        units=None,
-        variant_notes="RFD900x/ux only.",
-    )
-    for n in range(16)
+# --------------------------------------------------------------------- catalog
+# Source of truth — every parameter name rfdtool understands plus its
+# constraints. Adding a new firmware-specific name is one entry here.
+CATALOG: dict[str, ParamSpec] = {
+    # ---- canonical SiK + RFDesign common ----------------------------
+    "FORMAT": ParamSpec(
+        name="FORMAT",
+        label="Parameter format",
+        tooltip="Parameter format version reported by the firmware. "
+                "Read-only; written by the radio itself.",
+        kind="int", minimum=None, maximum=None, enum=None,
+        default=None, units=None, read_only=True,
+    ),
+    "SERIAL_SPEED": ParamSpec(
+        name="SERIAL_SPEED",
+        label="Serial baud rate",
+        tooltip="Baud rate of the host UART, expressed as the SiK shorthand "
+                "(e.g. 57 = 57600 baud). Both ends of the link must agree "
+                "with their respective hosts.",
+        kind="enum", minimum=None, maximum=None,
+        enum=dict(_SERIAL_SPEED_ENUM), default=57, units="kbps",
+    ),
+    "AIR_SPEED": ParamSpec(
+        name="AIR_SPEED",
+        label="Air data rate",
+        tooltip="Over-the-air data rate in kbps. Lower rates trade "
+                "throughput for range and link margin. Both ends must agree.",
+        kind="enum", minimum=None, maximum=None,
+        enum=dict(_AIR_SPEED_ENUM), default=64, units="kbps",
+        variant_notes=(
+            "RFD900/900+ supports the original SiK rate table up to 250 kbps. "
+            "RFD900x/x2 expose a curated subset (12/56/64/100/125/200/250). "
+            "The catalog encodes the superset so any reported value renders; "
+            "per-variant legality is enforced by the validator."
+        ),
+    ),
+    "NETID": ParamSpec(
+        name="NETID",
+        label="Network ID",
+        tooltip="Network identifier. Both ends of a link must share the "
+                "same NETID; radios on different NETIDs ignore each other.",
+        kind="int", minimum=0, maximum=499, enum=None,
+        default=25, units=None,
+    ),
+    "TXPOWER": ParamSpec(
+        name="TXPOWER",
+        label="Transmit power",
+        tooltip="Transmit power in dBm. Higher values extend range at the "
+                "cost of current draw and regulatory headroom.",
+        kind="int", minimum=0, maximum=30, enum=None,
+        default=20, units="dBm",
+        variant_notes="RFD900x/ux/x2 can hit 30 dBm (1 W); RFD900+ caps at 27; "
+                      "RFD900/a/u cap at 20.",
+    ),
+    "ECC": ParamSpec(
+        name="ECC",
+        label="Error correction (Golay)",
+        tooltip="Enables Golay forward error correction. Halves usable "
+                "throughput. Modern guidance is to leave this OFF — it "
+                "reduces effective range on most radios.",
+        kind="bool", minimum=None, maximum=None,
+        enum=dict(_BOOL_ENUM), default=0, units=None,
+    ),
+    "MAVLINK": ParamSpec(
+        name="MAVLINK",
+        label="MAVLink framing",
+        tooltip="Aligns radio packets with MAVLink message boundaries. "
+                "Mode 2 additionally prioritises RC_OVERRIDE packets, "
+                "useful for joystick control.",
+        kind="enum", minimum=None, maximum=None,
+        enum=dict(_MAVLINK_ENUM), default=1, units=None,
+    ),
+    "OPPRESEND": ParamSpec(
+        name="OPPRESEND",
+        label="Opportunistic resend",
+        tooltip="Opportunistic packet resend. When enabled, the radio fills "
+                "idle air time with retries of recent packets. Improves "
+                "robustness at the cost of throughput predictability.",
+        kind="bool", minimum=None, maximum=None,
+        enum=dict(_BOOL_ENUM), default=0, units=None,
+    ),
+    "MIN_FREQ": ParamSpec(
+        name="MIN_FREQ",
+        label="Minimum frequency",
+        tooltip="Lower bound of the frequency-hopping range, in kHz. Must "
+                "lie within the band the radio's hardware supports.",
+        kind="int", minimum=414000, maximum=976000, enum=None,
+        default=None, units="kHz",
+    ),
+    "MAX_FREQ": ParamSpec(
+        name="MAX_FREQ",
+        label="Maximum frequency",
+        tooltip="Upper bound of the frequency-hopping range, in kHz. Must "
+                "be strictly greater than MIN_FREQ.",
+        kind="int", minimum=414000, maximum=976000, enum=None,
+        default=None, units="kHz",
+    ),
+    "NUM_CHANNELS": ParamSpec(
+        name="NUM_CHANNELS",
+        label="Number of hopping channels",
+        tooltip="Number of frequency-hopping channels spread across "
+                "MIN_FREQ..MAX_FREQ. More channels improve coexistence. "
+                "RFDesign's newer firmwares accept values up to 255 (the "
+                "uint8 ceiling); per-region regulatory minimums are checked "
+                "separately by the validator.",
+        kind="int", minimum=1, maximum=255, enum=None,
+        default=20, units=None,
+    ),
+    "DUTY_CYCLE": ParamSpec(
+        name="DUTY_CYCLE",
+        label="Maximum duty cycle",
+        tooltip="Cap on transmit duty cycle as a percentage. Most regions "
+                "tolerate 100; EU sub-bands require 10 (or lower) plus LBT.",
+        kind="int", minimum=10, maximum=100, enum=None,
+        default=100, units="%",
+    ),
+    "LBT_RSSI": ParamSpec(
+        name="LBT_RSSI",
+        label="Listen-Before-Talk RSSI threshold",
+        tooltip="Set to 0 to disable Listen-Before-Talk, or 25..220 for an "
+                "RSSI threshold above which the radio backs off. EU "
+                "regulators require LBT in the 433 MHz sub-bands; "
+                "ETSI specifies ≥25.",
+        kind="int", minimum=0, maximum=220, enum=None,
+        default=0, units=None,
+    ),
+    "MANCHESTER": ParamSpec(
+        name="MANCHESTER",
+        label="Manchester encoding",
+        tooltip="Manchester-encodes the air signal. Doubles air-bandwidth "
+                "needs but improves robustness to DC drift. Present on "
+                "canonical SiK firmwares; RFDesign 3.x removes it.",
+        kind="bool", minimum=None, maximum=None,
+        enum=dict(_BOOL_ENUM), default=0, units=None,
+    ),
+    "RTSCTS": ParamSpec(
+        name="RTSCTS",
+        label="RTS/CTS hardware flow control",
+        tooltip="Hardware flow control on the host UART. Useful at high "
+                "AIR_SPEED + SERIAL_SPEED combinations to prevent overrun.",
+        kind="bool", minimum=None, maximum=None,
+        enum=dict(_BOOL_ENUM), default=0, units=None,
+    ),
+    "MAX_WINDOW": ParamSpec(
+        name="MAX_WINDOW",
+        label="Maximum TDM window",
+        tooltip="Maximum length of one TDM transmit window in milliseconds. "
+                "Larger windows favour throughput; smaller windows favour "
+                "latency (e.g. RC override). Newer firmwares may report 0 "
+                "when the parameter is unused for that radio.",
+        kind="int", minimum=0, maximum=131, enum=None,
+        default=131, units="ms",
+    ),
+
+    # ---- RFDesign SiK 3.x extensions --------------------------------
+    "ENCRYPTION_LEVEL": ParamSpec(
+        name="ENCRYPTION_LEVEL",
+        label="Encryption level",
+        tooltip="On-air encryption strength. 0 = disabled. RFDesign 3.x "
+                "exclusive; consult the firmware manual for valid levels.",
+        kind="int", minimum=0, maximum=255, enum=None,
+        default=0, units=None,
+        variant_notes="RFDesign SiK 3.x only.",
+    ),
+    "ANT_MODE": ParamSpec(
+        name="ANT_MODE",
+        label="Antenna mode",
+        tooltip="Antenna diversity / selection. RFDesign 3.x exclusive.",
+        kind="int", minimum=0, maximum=255, enum=None,
+        default=0, units=None,
+    ),
+    "AIR_FRAMELEN": ParamSpec(
+        name="AIR_FRAMELEN",
+        label="Air frame length",
+        tooltip="Air-frame length parameter for the RFDesign 3.x scheduler. "
+                "Affects effective throughput and packet alignment.",
+        kind="int", minimum=0, maximum=255, enum=None,
+        default=120, units=None,
+    ),
+    "RSSI_IN_DBM": ParamSpec(
+        name="RSSI_IN_DBM",
+        label="Report RSSI in dBm",
+        tooltip="When on, RSSI fields in MAVLink RADIO_STATUS and ATI7 "
+                "are reported as signed dBm rather than raw counts.",
+        kind="bool", minimum=None, maximum=None,
+        enum=dict(_BOOL_ENUM), default=0, units=None,
+    ),
+    "FSFRAMELOSS": ParamSpec(
+        name="FSFRAMELOSS",
+        label="Failsafe frame loss",
+        tooltip="Number of consecutive frame losses before failsafe "
+                "trigger. RFDesign 3.x exclusive.",
+        kind="int", minimum=0, maximum=255, enum=None,
+        default=50, units=None,
+    ),
+    "AUXSER_SPEED": ParamSpec(
+        name="AUXSER_SPEED",
+        label="Auxiliary UART speed",
+        tooltip="Baud-rate shorthand for the second (auxiliary) UART on "
+                "boards that expose one. Same encoding as SERIAL_SPEED.",
+        kind="enum", minimum=None, maximum=None,
+        enum=dict(_SERIAL_SPEED_ENUM), default=57, units="kbps",
+    ),
+
+    # ---- Pin/GPIO function selectors (RFDesign 3.x advanced) --------
+    "GPI1_1R/CIN": ParamSpec(
+        name="GPI1_1R/CIN",
+        label="GPIO 1.1 — RC input",
+        tooltip="Function selector for GPIO 1.1 acting as an RC input.",
+        kind="int", minimum=0, maximum=255, enum=None, default=0, units=None,
+    ),
+    "GPO1_1R/COUT": ParamSpec(
+        name="GPO1_1R/COUT",
+        label="GPIO 1.1 — RC output",
+        tooltip="Function selector for GPIO 1.1 acting as an RC output.",
+        kind="int", minimum=0, maximum=255, enum=None, default=0, units=None,
+    ),
+    "GPO1_1SBUSIN": ParamSpec(
+        name="GPO1_1SBUSIN",
+        label="GPIO 1.1 — SBUS input",
+        tooltip="Function selector for GPIO 1.1 acting as an SBUS input.",
+        kind="int", minimum=0, maximum=255, enum=None, default=0, units=None,
+    ),
+    "GPO1_1SBUSOUT": ParamSpec(
+        name="GPO1_1SBUSOUT",
+        label="GPIO 1.1 — SBUS output",
+        tooltip="Function selector for GPIO 1.1 acting as an SBUS output.",
+        kind="int", minimum=0, maximum=255, enum=None, default=0, units=None,
+    ),
+    "GPO1_3STATLED": ParamSpec(
+        name="GPO1_3STATLED",
+        label="GPIO 1.3 — status LED",
+        tooltip="GPIO 1.3 driving a link-status LED.",
+        kind="int", minimum=0, maximum=255, enum=None, default=0, units=None,
+    ),
+    "GPO1_0TXEN485": ParamSpec(
+        name="GPO1_0TXEN485",
+        label="GPIO 1.0 — RS-485 TX enable",
+        tooltip="GPIO 1.0 driving an RS-485 transceiver's TX-enable pin.",
+        kind="int", minimum=0, maximum=255, enum=None, default=0, units=None,
+    ),
+    "RATE/FREQBAND": ParamSpec(
+        name="RATE/FREQBAND",
+        label="Rate / frequency band",
+        tooltip="Combined rate and frequency-band selector. RFDesign 3.x "
+                "internal; consult the firmware manual.",
+        kind="int", minimum=0, maximum=255, enum=None, default=0, units=None,
+    ),
+    "GPI1_2AUXIN": ParamSpec(
+        name="GPI1_2AUXIN",
+        label="GPIO 1.2 — auxiliary input",
+        tooltip="GPIO 1.2 acting as an auxiliary input.",
+        kind="int", minimum=0, maximum=255, enum=None, default=0, units=None,
+    ),
+    "GPO1_3AUXOUT": ParamSpec(
+        name="GPO1_3AUXOUT",
+        label="GPIO 1.3 — auxiliary output",
+        tooltip="GPIO 1.3 acting as an auxiliary output.",
+        kind="int", minimum=0, maximum=255, enum=None, default=0, units=None,
+    ),
+
+    # ---- Pin / R-register names (RFDesign 3.x exposes named R-regs) -
+    "PIN_FUNC": ParamSpec(
+        name="PIN_FUNC",
+        label="Pin function",
+        tooltip="Selects the function of a GPIO pin. Pin mapping is "
+                "available on RFD900x/ux/x2 only; older variants ignore "
+                "these registers.",
+        kind="enum", minimum=None, maximum=None,
+        enum=dict(_PIN_FUNCTION_ENUM), default=0, units=None,
+    ),
+    "TARGET_RSSI_dBm": ParamSpec(
+        name="TARGET_RSSI_dBm",
+        label="Target RSSI (dBm)",
+        tooltip="Target receive signal level in dBm. Used by adaptive "
+                "TX power algorithms in RFDesign 3.x firmware.",
+        kind="int", minimum=-127, maximum=127, enum=None,
+        default=0, units="dBm",
+    ),
+    "HYSTERESIS_RSSI_dBm": ParamSpec(
+        name="HYSTERESIS_RSSI_dBm",
+        label="RSSI hysteresis (dBm)",
+        tooltip="Hysteresis margin around the target RSSI before TX power "
+                "adjusts.",
+        kind="int", minimum=0, maximum=127, enum=None,
+        default=5, units="dBm",
+    ),
 }
 
 
-def _table(pin: bool) -> dict[int, RegisterDef]:
-    return PIN_REGISTERS if pin else REGISTERS
+# --------------------------------------------------------------------- canonical mapping
+# What sreg numbers the original ArduPilot/SiK firmware uses for each
+# parameter.  Used:
+#   * to populate :data:`REGISTERS` for backwards-compatible callers
+#   * to convert v1/v2 JSON profiles (sreg-keyed) into name-keyed Profiles
+#   * as the fallback sreg→name map in :func:`validation.validate_config`
+#     when the caller doesn't supply the firmware's actual mapping
+CANONICAL_SIK_NAMES: dict[int, str] = {
+    0: "FORMAT",
+    1: "SERIAL_SPEED",
+    2: "AIR_SPEED",
+    3: "NETID",
+    4: "TXPOWER",
+    5: "ECC",
+    6: "MAVLINK",
+    7: "OPPRESEND",
+    8: "MIN_FREQ",
+    9: "MAX_FREQ",
+    10: "NUM_CHANNELS",
+    11: "DUTY_CYCLE",
+    12: "LBT_RSSI",
+    13: "MANCHESTER",
+    14: "RTSCTS",
+    15: "MAX_WINDOW",
+}
 
 
-def get_register(sreg: int, *, pin: bool = False) -> RegisterDef:
-    table = _table(pin)
-    return table[sreg]
+CANONICAL_PIN_NAMES: dict[int, str] = {n: "PIN_FUNC" for n in range(16)}
 
 
-def all_registers() -> list[RegisterDef]:
-    return [REGISTERS[k] for k in sorted(REGISTERS)]
+# Generic spec applied when a firmware reports a parameter name we don't
+# have in CATALOG.  Lets the UI render the row with a sensible widget
+# instead of a placeholder; the user can edit the value, and saves
+# round-trip even though we don't know the parameter's semantics.
+_GENERIC_PARAM = ParamSpec(
+    name="ADV",
+    label="(advanced)",
+    tooltip="Advanced/firmware-specific register. Meaning depends on the "
+            "exact firmware build — consult the radio's manual.",
+    kind="int", minimum=0, maximum=65535, enum=None,
+    default=None, units=None,
+    variant_notes="Reported by firmware but not present in the rfdtool catalog.",
+)
 
 
-def all_pin_registers() -> list[RegisterDef]:
-    return [PIN_REGISTERS[k] for k in sorted(PIN_REGISTERS)]
+# --------------------------------------------------------------------- accessors
+def get_spec(name: str) -> ParamSpec | None:
+    """Return the catalog spec for `name`, or None if unknown."""
+    return CATALOG.get(name)
+
+
+def derive_def(sreg: int, name: str | None = None) -> RegisterDef:
+    """Build a :class:`RegisterDef` for the given sreg and parameter name.
+
+    If `name` is None or absent from the catalog, a generic int-spec is
+    used so the UI still renders a row instead of a placeholder.
+    """
+    spec = (CATALOG.get(name) if name else None) or _GENERIC_PARAM
+    if spec is _GENERIC_PARAM:
+        # Unknown name — synthesise a label that still identifies the row,
+        # using sreg + name (if reported by firmware) so users can
+        # correlate with manuals / forums.
+        if name:
+            display_label = f"S{sreg} {name} (advanced)"
+        else:
+            display_label = f"S{sreg} (advanced)"
+    else:
+        display_label = spec.label
+    return RegisterDef(
+        sreg=sreg,
+        name=name or spec.name,
+        label=display_label,
+        tooltip=spec.tooltip,
+        kind=spec.kind,
+        minimum=spec.minimum,
+        maximum=spec.maximum,
+        enum=dict(spec.enum) if spec.enum is not None else None,
+        default=spec.default,
+        units=spec.units,
+        variant_notes=spec.variant_notes,
+        read_only=spec.read_only,
+    )
+
+
+def validate_value(name: str, value: int) -> tuple[bool, str]:
+    """Name-based validation. Unknown names accept any int value."""
+    spec = CATALOG.get(name)
+    if spec is None:
+        return True, ""
+    return _validate_against_spec(spec, value, sreg_label=name)
+
+
+def _validate_against_spec(
+    spec: ParamSpec, value: int, *, sreg_label: str = "",
+) -> tuple[bool, str]:
+    if spec.read_only:
+        return False, f"{sreg_label or spec.name} is read-only"
+    if spec.kind == "int":
+        if spec.minimum is not None and value < spec.minimum:
+            return False, (
+                f"{sreg_label or spec.name}: {value} out of range "
+                f"({spec.minimum}..{spec.maximum})"
+            )
+        if spec.maximum is not None and value > spec.maximum:
+            return False, (
+                f"{sreg_label or spec.name}: {value} out of range "
+                f"({spec.minimum}..{spec.maximum})"
+            )
+        return True, ""
+    if spec.kind == "enum":
+        if spec.enum and value in spec.enum:
+            return True, ""
+        return False, (
+            f"{sreg_label or spec.name}: {value} is not a supported value"
+        )
+    if spec.kind == "bool":
+        if value in (0, 1):
+            return True, ""
+        return False, (
+            f"{sreg_label or spec.name}: {value} is not 0 or 1"
+        )
+    return False, f"{sreg_label or spec.name}: unknown kind {spec.kind!r}"
+
+
+# --------------------------------------------------------------------- legacy sreg API
+# Built once from CATALOG + CANONICAL_SIK_NAMES.  Adding generic
+# advanced rows for S16..S29 mirrors what real RFDesign firmware returns.
+REGISTERS: dict[int, RegisterDef] = {
+    sreg: derive_def(sreg, name) for sreg, name in CANONICAL_SIK_NAMES.items()
+}
+for _sreg in range(16, 30):
+    REGISTERS[_sreg] = derive_def(_sreg, None)
+
+
+PIN_REGISTERS: dict[int, RegisterDef] = {}
+for _pin in range(16):
+    pin_name = CANONICAL_PIN_NAMES.get(_pin, "PIN_FUNC")
+    pin_def = derive_def(_pin, pin_name)
+    PIN_REGISTERS[_pin] = RegisterDef(
+        sreg=pin_def.sreg,
+        name=pin_def.name,
+        label=f"Pin R{_pin} function",
+        tooltip=pin_def.tooltip,
+        kind=pin_def.kind,
+        minimum=pin_def.minimum,
+        maximum=pin_def.maximum,
+        enum=pin_def.enum,
+        default=pin_def.default,
+        units=pin_def.units,
+        variant_notes=pin_def.variant_notes,
+        read_only=pin_def.read_only,
+    )
 
 
 def validate(sreg: int, value: int, *, pin: bool = False) -> tuple[bool, str]:
-    table = _table(pin)
-    prefix = "R" if pin else "S"
+    """Legacy sreg-based validator. Looks up the canonical name for `sreg`
+    in the appropriate map and delegates to :func:`validate_value`.
+
+    Kept so existing callers (and tests) still work after the catalog refactor.
+    """
+    table = PIN_REGISTERS if pin else REGISTERS
     reg = table.get(sreg)
     if reg is None:
+        prefix = "R" if pin else "S"
         return False, f"unknown register {prefix}{sreg}"
+    return _validate_against_spec(
+        CATALOG.get(reg.name) or _GENERIC_PARAM,
+        value,
+        sreg_label=f"S{sreg} {reg.name}" if not pin else f"R{sreg} {reg.name}",
+    )
 
-    if reg.read_only:
-        return False, f"{reg.name} is read-only"
 
-    tag = f"{prefix}{sreg} {reg.name}"
+def all_registers() -> list[RegisterDef]:
+    return [REGISTERS[s] for s in sorted(REGISTERS.keys())]
 
-    if reg.kind == "int":
-        lo, hi = reg.minimum, reg.maximum
-        if lo is None or hi is None:
-            # Defensive: an int register with no range can't be meaningfully
-            # validated here. Treat any int as acceptable.
-            return True, ""
-        if not (lo <= value <= hi):
-            return False, f"{tag}: {value} out of range ({lo}..{hi})"
-        return True, ""
 
-    if reg.kind == "enum":
-        if reg.enum is None or value not in reg.enum:
-            if reg.name == "AIR_SPEED":
-                return False, f"{tag}: {value} is not a supported air rate"
-            return False, f"{tag}: {value} is not a valid option"
-        return True, ""
+def all_pin_registers() -> list[RegisterDef]:
+    return [PIN_REGISTERS[s] for s in sorted(PIN_REGISTERS.keys())]
 
-    if reg.kind == "bool":
-        if value not in (0, 1):
-            return False, f"{tag}: {value} is not 0 or 1"
-        return True, ""
 
-    return False, f"{tag}: unknown kind {reg.kind!r}"
+def get_register(sreg: int, *, pin: bool = False) -> RegisterDef:
+    table = PIN_REGISTERS if pin else REGISTERS
+    return table[sreg]

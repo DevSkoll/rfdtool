@@ -73,6 +73,8 @@ class ApplyPresetDialog(QDialog):
         current_values: dict[int, int],
         *,
         board_name: str = "",
+        name_to_sreg: dict[str, int] | None = None,
+        sreg_to_name: dict[int, str] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -80,6 +82,14 @@ class ApplyPresetDialog(QDialog):
         self.setModal(True)
         self.resize(620, 480)
         self._profile = profile
+
+        # Resolve the name → sreg map. Defaults to canonical SiK so this
+        # dialog still works when called without explicit mapping.
+        if name_to_sreg is None:
+            from rfd.registers import CANONICAL_SIK_NAMES
+            name_to_sreg = {n: s for s, n in CANONICAL_SIK_NAMES.items()}
+        if sreg_to_name is None:
+            sreg_to_name = {s: n for n, s in name_to_sreg.items()}
 
         root = QVBoxLayout(self)
 
@@ -110,7 +120,7 @@ class ApplyPresetDialog(QDialog):
             warn.setWordWrap(True)
             root.addWidget(warn)
 
-        # Diff list
+        # Diff list — walk preset by NAME and translate to the radio's sreg.
         diff_label = QLabel("<b>Changes that will be staged:</b>")
         diff_label.setTextFormat(Qt.TextFormat.RichText)
         root.addWidget(diff_label)
@@ -123,18 +133,25 @@ class ApplyPresetDialog(QDialog):
         diff_layout.setSpacing(2)
 
         any_change = False
-        for sreg in sorted(profile.s_registers.keys()):
-            new_val = profile.s_registers[sreg]
-            cur_val = current_values.get(sreg)
+        skipped: list[str] = []
+        for name in sorted(profile.params):
+            new_val = profile.params[name]
+            sreg = name_to_sreg.get(name)
+            if sreg is None:
+                # Parameter exists in the preset but not on this firmware.
+                skipped.append(name)
+                continue
             reg = REGISTERS.get(sreg)
             if reg is None or reg.read_only:
                 continue
+            cur_val = current_values.get(sreg)
             if cur_val == new_val:
                 continue
             cur_str = _format_value(reg, cur_val) if cur_val is not None else "(unset)"
             new_str = _format_value(reg, new_val)
+            firmware_name = sreg_to_name.get(sreg, name)
             line = QLabel(
-                f"<code>S{sreg:<2}</code> {reg.label}: "
+                f"<code>S{sreg:<2}</code> {firmware_name}: "
                 f"<span style='color:#888;'>{cur_str}</span> → "
                 f"<b>{new_str}</b>"
             )
@@ -144,6 +161,16 @@ class ApplyPresetDialog(QDialog):
 
         if not any_change:
             diff_layout.addWidget(QLabel("(no changes — current values already match)"))
+
+        if skipped:
+            skip_lbl = QLabel(
+                f"<span style='color:#888;'>"
+                f"<i>Will be skipped (not present on this radio): "
+                f"{', '.join(skipped)}</i></span>"
+            )
+            skip_lbl.setTextFormat(Qt.TextFormat.RichText)
+            skip_lbl.setWordWrap(True)
+            diff_layout.addWidget(skip_lbl)
 
         diff_layout.addStretch(1)
         diff_scroll.setWidget(diff_widget)
@@ -159,12 +186,14 @@ class ApplyPresetDialog(QDialog):
             notes.setWordWrap(True)
             root.addWidget(notes)
 
-        # Special warning if S1 (baud) will change — that breaks the
+        # Special warning if SERIAL_SPEED will change — that breaks the
         # current connection on the next save.
-        if 1 in profile.s_registers and current_values.get(1) != profile.s_registers[1]:
+        baud_sreg = name_to_sreg.get("SERIAL_SPEED")
+        baud_new = profile.params.get("SERIAL_SPEED")
+        if baud_sreg is not None and baud_new is not None and current_values.get(baud_sreg) != baud_new:
             note = QLabel(
                 f"<span style='color:{_SEVERITY_COLOURS['warning']};'>"
-                f"⚠ This preset changes SERIAL_SPEED (S1). After saving, "
+                f"⚠ This preset changes SERIAL_SPEED. After saving, "
                 f"you'll need to reconnect at the new baud.</span>"
             )
             note.setTextFormat(Qt.TextFormat.RichText)
