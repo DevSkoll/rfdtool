@@ -44,6 +44,7 @@ from rfd.presets import (
     list_user_profiles,
     load_profile,
     presets_by_category,
+    profile_from_ati5,
     save_profile,
     save_user_profile,
     user_profile_dir,
@@ -738,6 +739,27 @@ class SettingsTab(QWidget):
         save_user_act.triggered.connect(self._on_save_user_preset)
         self._profiles_menu.addAction(save_user_act)
 
+        export_live_act = QAction("Export live config from radio…", self._profiles_menu)
+        export_live_act.setToolTip(
+            "Re-read the radio's current settings via ATI5 and save them as a "
+            "transferable JSON profile. Use this to copy a working config to "
+            "another PC."
+        )
+        export_live_act.triggered.connect(self._on_export_live_config)
+        export_live_act.setEnabled(self._state in _LIVE_STATES)
+        self._profiles_menu.addAction(export_live_act)
+
+        # Compare submenu: live vs JSON / live vs remote
+        compare_sub = self._profiles_menu.addMenu("Compare configs")
+        compare_json_act = QAction("…with a JSON profile…", compare_sub)
+        compare_json_act.triggered.connect(self._on_compare_with_json)
+        compare_json_act.setEnabled(self._state in _LIVE_STATES)
+        compare_sub.addAction(compare_json_act)
+        compare_remote_act = QAction("…with the remote radio (live)", compare_sub)
+        compare_remote_act.triggered.connect(self._on_compare_with_remote)
+        compare_remote_act.setEnabled(self._state in _LIVE_STATES)
+        compare_sub.addAction(compare_remote_act)
+
         self._profiles_menu.addSeparator()
 
         load_act = QAction("Import preset from JSON…", self._profiles_menu)
@@ -1098,6 +1120,266 @@ class SettingsTab(QWidget):
             QMessageBox.critical(self, "Save preset failed", str(e))
             return
         self._emit_status(f"Saved preset '{name}' to {target}", 5000)
+
+    # ---------------------------------------------------------------- export live config
+    def _on_export_live_config(self) -> None:
+        """Re-read ATI5 from the radio and save the result as a Profile.
+
+        Listens for the next ``params_loaded(local)`` signal, builds a
+        :class:`Profile` from the firmware's reported names + radio_info,
+        and prompts for a save location (user preset dir + optional JSON).
+        """
+        if self._state not in _LIVE_STATES:
+            QMessageBox.warning(
+                self, "Export live config",
+                "Connect to a radio first.",
+            )
+            return
+
+        # Cache the radio_info for the capture (banner + board name).
+        radio_info = {
+            "banner": self._firmware_banner,
+            "board_name": self._board_name,
+        }
+
+        # One-shot listener for the next local params_loaded.
+        def _on_loaded(result: object, is_remote: bool) -> None:
+            if is_remote:
+                return
+            try:
+                self._radio.params_loaded.disconnect(_on_loaded)
+            except Exception:
+                pass
+            self._show_export_dialog(result, radio_info)
+
+        self._radio.params_loaded.connect(_on_loaded)
+        self._emit_status("Re-reading live config from radio…", 3000)
+        self._radio.read_params(False)
+
+    def _show_export_dialog(self, ati5: object, radio_info: dict) -> None:
+        # Pick a default name based on board + timestamp.
+        from datetime import datetime
+        board = radio_info.get("board_name") or "rfd900"
+        default_name = f"{board} live {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+
+        # Collect name + description + notes via the existing SavePresetDialog
+        # so the UX matches "Save current as user preset…".
+        from .validation_dialog import SavePresetDialog
+        dialog = SavePresetDialog(
+            suggested_name=default_name,
+            board_name=self._board_name,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        name = dialog.name()
+        if not name:
+            QMessageBox.warning(self, "Export live config", "Name cannot be empty.")
+            return
+
+        profile = profile_from_ati5(
+            name,
+            ati5,
+            radio_info=radio_info,
+            description=dialog.description(),
+            notes=dialog.notes(),
+        )
+        # If the user opted to tag this preset as board-specific, override
+        # what profile_from_ati5 stamped (the dialog's choice wins).
+        if dialog.applies_to():
+            profile.applies_to = dialog.applies_to()
+
+        # Save to user preset dir.
+        try:
+            target = save_user_profile(profile)
+        except Exception as e:
+            QMessageBox.critical(self, "Export live config failed", str(e))
+            return
+
+        # Offer to also write a portable copy for cross-PC transfer.
+        ans = QMessageBox.question(
+            self, "Export live config",
+            (
+                f"Saved live config to:\n  {target}\n\n"
+                f"Captured {len(profile.params)} parameter(s) from {board}.\n\n"
+                "Also save a portable JSON copy somewhere else "
+                "(USB stick / shared folder)?"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ans == QMessageBox.StandardButton.Yes:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save portable copy", f"{name}.json",
+                "JSON profiles (*.json);;All files (*)",
+            )
+            if path:
+                try:
+                    save_profile(path, profile)
+                except Exception as e:
+                    QMessageBox.critical(self, "Save copy failed", str(e))
+                    return
+                self._emit_status(f"Saved portable copy to {path}", 6000)
+
+        self._emit_status(
+            f"Exported live config '{name}' "
+            f"({len(profile.params)} parameters)",
+            6000,
+        )
+
+    # ---------------------------------------------------------------- compare
+    def _on_compare_with_json(self) -> None:
+        """Diff the local radio's live config against a saved JSON profile."""
+        if self._state not in _LIVE_STATES:
+            QMessageBox.warning(
+                self, "Compare configs", "Connect to a radio first.",
+            )
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Compare against profile",
+            "",
+            "JSON profiles (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            ref = load_profile(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Load failed", str(e))
+            return
+
+        # Re-read local via ATI5 to capture firmware names + values
+        def _on_loaded(result, is_remote):
+            if is_remote:
+                return
+            try:
+                self._radio.params_loaded.disconnect(_on_loaded)
+            except Exception:
+                pass
+            self._show_compare_dialog(
+                "Local (this radio)",
+                getattr(result, "s_params", {}) or {},
+                getattr(result, "s_names", {}) or {},
+                f"Profile: {ref.name}",
+                ref.params,
+                {},   # JSON profile doesn't carry sregs — ok, dialog tolerates
+            )
+        self._radio.params_loaded.connect(_on_loaded)
+        self._emit_status("Re-reading live config to compare…", 3000)
+        self._radio.read_params(False)
+
+    def _on_compare_with_remote(self) -> None:
+        """Diff the local radio's live config against the remote (RTI5)."""
+        if self._state not in _LIVE_STATES:
+            QMessageBox.warning(
+                self, "Compare configs", "Connect to a radio first.",
+            )
+            return
+
+        local_payload = {"params": {}, "names": {}}
+        remote_payload = {"params": {}, "names": {}}
+
+        # Capture local first
+        def _on_local(result, is_remote):
+            if is_remote:
+                return
+            try:
+                self._radio.params_loaded.disconnect(_on_local)
+            except Exception:
+                pass
+            local_payload["params"] = getattr(result, "s_params", {}) or {}
+            local_payload["names"] = getattr(result, "s_names", {}) or {}
+            # Now request remote
+            self._radio.params_loaded.connect(_on_remote)
+            self._radio.error.connect(_on_remote_error)
+            self._emit_status("Reading remote settings (RTI5)…", 4000)
+            self._radio.read_params(True)
+
+        def _on_remote(result, is_remote):
+            if not is_remote:
+                return
+            try:
+                self._radio.params_loaded.disconnect(_on_remote)
+                self._radio.error.disconnect(_on_remote_error)
+            except Exception:
+                pass
+            remote_payload["params"] = getattr(result, "s_params", {}) or {}
+            remote_payload["names"] = getattr(result, "s_names", {}) or {}
+            _show()
+
+        def _on_remote_error(_msg):
+            try:
+                self._radio.params_loaded.disconnect(_on_remote)
+                self._radio.error.disconnect(_on_remote_error)
+            except Exception:
+                pass
+            QMessageBox.warning(
+                self, "Remote unreachable",
+                "RTI5 returned an error — the radios aren't linked yet, "
+                "so the remote's config can't be read. Pair them first, "
+                "or use 'Compare with JSON profile' instead.",
+            )
+
+        def _show():
+            self._show_compare_dialog(
+                "Local",
+                local_payload["params"], local_payload["names"],
+                "Remote (live)",
+                remote_payload["params"], remote_payload["names"],
+            )
+
+        self._radio.params_loaded.connect(_on_local)
+        self._emit_status("Reading local settings…", 3000)
+        self._radio.read_params(False)
+
+    def _show_compare_dialog(
+        self,
+        a_label: str,
+        a_s_params: dict[int, int],
+        a_s_names: dict[int, str],
+        b_label: str,
+        b_params_by_name_or_sreg,
+        b_s_names: dict[int, str],
+    ) -> None:
+        from .compare_dialog import CompareConfigsDialog
+        # A side: build name → value and name → sreg from ATI5 result
+        a_params: dict[str, int] = {}
+        a_sregs: dict[str, int] = {}
+        for sreg, name in a_s_names.items():
+            if not name:
+                continue
+            a_sregs[name] = sreg
+            if sreg in a_s_params:
+                a_params[name] = a_s_params[sreg]
+        # B side: tolerate either {sreg: val} (with names) or {name: val}
+        b_params: dict[str, int] = {}
+        b_sregs: dict[str, int] = {}
+        if b_s_names:
+            # remote ATI5
+            for sreg, name in b_s_names.items():
+                if not name:
+                    continue
+                b_sregs[name] = sreg
+                if sreg in b_params_by_name_or_sreg:
+                    b_params[name] = b_params_by_name_or_sreg[sreg]
+        else:
+            # name-keyed (e.g. profile.params)
+            for k, v in b_params_by_name_or_sreg.items():
+                b_params[str(k)] = int(v)
+            # No B-side sregs available; CompareConfigsDialog renders ok.
+        dialog = CompareConfigsDialog(
+            a_label, a_params, a_sregs,
+            b_label, b_params, b_sregs,
+            parent=self,
+        )
+        dialog.apply_fix_requested.connect(self._on_apply_validation_fix)
+        dialog.apply_all_fixes_requested.connect(self._on_apply_bulk_fixes)
+        dialog.exec()
+
+    def _on_apply_bulk_fixes(self, bundle) -> None:
+        """Stage a set of (sreg, value) fixes from the Compare dialog."""
+        for sreg, value in bundle:
+            self._on_apply_validation_fix(int(sreg), int(value))
 
     def _on_manage_user_presets(self) -> None:
         # Minimal manage flow: list + delete via QMessageBox confirms.

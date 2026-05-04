@@ -72,9 +72,45 @@ class MainWindow(QMainWindow):
         file_menu.addAction(quit_action)
 
         help_menu = bar.addMenu("&Help")
+
+        wizard_action = QAction("&Pairing wizard…", self)
+        wizard_action.setShortcut("Ctrl+P")
+        wizard_action.triggered.connect(self._show_pairing_wizard)
+        help_menu.addAction(wizard_action)
+
+        guide_action = QAction("Pairing &guide", self)
+        guide_action.triggered.connect(self._show_pairing_guide)
+        help_menu.addAction(guide_action)
+
+        help_menu.addSeparator()
+
         about_action = QAction("&About rfdtool", self)
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
+
+    def _show_pairing_wizard(self) -> None:
+        from .pairing_wizard import PairingWizard
+        st = self.settings_tab
+        # Capture current panel mappings via providers so the wizard always
+        # sees fresh values even after the panel rebuilds on a fresh ATI5.
+        wizard = PairingWizard(
+            self.radio,
+            name_to_sreg_provider=lambda: st._local_panel.name_to_sreg(),
+            sreg_to_name_provider=lambda: st._local_panel.sreg_to_name(),
+            firmware_banner_provider=lambda: st._firmware_banner,
+            board_name_provider=lambda: st._board_name,
+            parent=self,
+        )
+        # Pipe Stage-5 / Compare's "Apply fix" signals back to the settings
+        # tab's existing fix-staging plumbing.
+        wizard.apply_fix_requested.connect(st._on_apply_validation_fix)
+        wizard.exec()
+
+    def _show_pairing_guide(self) -> None:
+        from .pairing_guide import PairingGuideDialog
+        guide = PairingGuideDialog(parent=self)
+        guide.open_wizard_requested.connect(self._show_pairing_wizard)
+        guide.show()
 
     def _show_about(self) -> None:
         QMessageBox.about(

@@ -205,6 +205,79 @@ def delete_user_profile(profile: Profile) -> bool:
     return False
 
 
+# --------------------------------------------------------------------- live capture
+def profile_from_ati5(
+    name: str,
+    ati5: object,
+    *,
+    radio_info: dict | None = None,
+    description: str = "",
+    notes: str = "",
+) -> Profile:
+    """Build a Profile from a fresh ATI5 read.
+
+    Captures the firmware's reported parameter NAMES (so RFDesign 3.x extras
+    like ENCRYPTION_LEVEL and AIR_FRAMELEN survive the round-trip) plus a
+    Markdown block of identity metadata in ``notes`` for traceability of
+    where the config came from.
+
+    Skips read-only parameters (e.g. FORMAT) — those are firmware-set and
+    aren't worth re-applying to the destination radio.
+
+    ``ati5`` is duck-typed so this function doesn't have to import the
+    Qt-touching protocol module; in practice it's :class:`Ati5Result` from
+    ``rfd.protocol``.
+    """
+    s_params: dict[int, int] = dict(getattr(ati5, "s_params", {}) or {})
+    s_names: dict[int, str] = dict(getattr(ati5, "s_names", {}) or {})
+    pin_params: dict[int, int] = dict(getattr(ati5, "pin_params", {}) or {})
+
+    # Build name-keyed params using the firmware's own names; skip names we
+    # know to be read-only.
+    from .registers import CATALOG
+    params: dict[str, int] = {}
+    for sreg, value in s_params.items():
+        pname = s_names.get(sreg)
+        if not pname:
+            continue
+        spec = CATALOG.get(pname)
+        if spec is not None and spec.read_only:
+            continue
+        params[pname] = int(value)
+
+    # Optional metadata header inside notes for traceability.
+    meta_lines: list[str] = []
+    if radio_info:
+        meta_lines.append("Captured from:")
+        for key in ("banner", "board_name", "board_id", "freq_id",
+                    "bootloader_version"):
+            v = radio_info.get(key)
+            if v is None or v == "":
+                continue
+            meta_lines.append(f"  - {key}: {v}")
+    full_notes = "\n".join(meta_lines + ([notes] if notes else [])).strip()
+
+    # applies_to defaults to the source board name when known, so applying
+    # this profile to a different SKU triggers ApplyPresetDialog's mismatch
+    # warning.
+    applies_to: list[str] = []
+    if radio_info and radio_info.get("board_name"):
+        bn = str(radio_info["board_name"])
+        # Skip the unknown placeholder names emitted by protocol.board_name()
+        if bn and not bn.lower().startswith("unknown"):
+            applies_to.append(bn)
+
+    return Profile(
+        name=name,
+        description=description,
+        params=params,
+        pin_registers=pin_params,
+        applies_to=applies_to,
+        category=CATEGORY_USER,
+        notes=full_notes,
+    )
+
+
 # --------------------------------------------------------------------- built-ins
 # Defined name-keyed so they apply correctly across firmware variants.
 # The settings tab translates names to sregs using the radio's reported
